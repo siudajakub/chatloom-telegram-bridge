@@ -107,8 +107,13 @@ func (tc *TelegramClient) getDMChatInfo(ctx context.Context, userID int64) (*bri
 			MemberMap:   map[networkid.UserID]bridgev2.ChatMember{},
 			PowerLevels: tc.getDMPowerLevels(ghost),
 		},
-		CanBackfill:  !tc.metadata.IsBot,
-		ExtraUpdates: updatePortalLastSyncAt,
+		CanBackfill: !tc.metadata.IsBot,
+		ExtraUpdates: func(ctx context.Context, portal *bridgev2.Portal) bool {
+			updatePortalLastSyncAt(ctx, portal)
+			permission, _ := tc.checkRoundPermission(ctx, portal)
+			setRoundPermission(portal, string(tc.userLogin.ID), permission)
+			return true
+		},
 	}
 	chatInfo.Members.MemberMap.Add(bridgev2.ChatMember{EventSender: tc.mySender()})
 	chatInfo.Members.MemberMap.Add(bridgev2.ChatMember{EventSender: tc.senderForUserID(userID)})
@@ -239,6 +244,19 @@ func (tc *TelegramClient) wrapChatInfo(portalID networkid.PortalID, rawChat tg.C
 	}
 	info.ExtraUpdates = func(ctx context.Context, portal *bridgev2.Portal) bool {
 		meta := portal.Metadata.(*PortalMetadata)
+		switch c := rawChat.(type) {
+		case *tg.Chat:
+			meta.ProtectedContent = ptr.Ptr(c.Noforwards)
+		case *tg.Channel:
+			if c.Min {
+				meta.ProtectedContent = nil
+			} else {
+				meta.ProtectedContent = ptr.Ptr(c.Noforwards)
+			}
+		default:
+			meta.ProtectedContent = nil
+		}
+		setRoundPermission(portal, string(tc.userLogin.ID), roundPermissionFromChat(rawChat, time.Now()))
 		_ = updatePortalLastSyncAt(ctx, portal)
 		changed := meta.SetIsSuperGroup(isMegagroup)
 		changed = meta.SetIsCommunity(isCommunity) || changed
