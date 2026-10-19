@@ -138,6 +138,10 @@ func (tc *TelegramClient) FetchMessages(ctx context.Context, fetchParams bridgev
 	if err != nil {
 		return nil, err
 	}
+	peerType, peerID, _, err := ids.ParsePortalID(fetchParams.Portal.ID)
+	if err != nil {
+		return nil, err
+	}
 
 	var minID, offsetID int
 	aggressiveDedup := false
@@ -187,7 +191,7 @@ func (tc *TelegramClient) FetchMessages(ctx context.Context, fetchParams bridgev
 		if takeoutID != 0 {
 			req = &tg.InvokeWithTakeoutRequest{TakeoutID: takeoutID, Query: req}
 		}
-		log.Info().Any("req", req).Msg("Fetching messages")
+		log.Info().Type("request_type", req).Msg("Fetching message history")
 		resp, err := APICallWithUpdates(ctx, tc, func() (tg.ModifiedMessagesMessages, error) {
 			var box tg.MessagesMessagesBox
 			retry := true
@@ -218,6 +222,9 @@ func (tc *TelegramClient) FetchMessages(ctx context.Context, fetchParams bridgev
 			}
 			return nil, err
 		}
+		// Use the current history response rather than a stale cached false.
+		// Missing/min-only group policy remains unknown and blocks media.
+		fetchParams.Portal.Metadata.(*PortalMetadata).ProtectedContent = mediaProtectionFromChats(peerType, peerID, resp.GetChats())
 		newMessages := resp.GetMessages()
 		if messages == nil {
 			messages = newMessages
@@ -334,6 +341,16 @@ func (tc *TelegramClient) FetchMessages(ctx context.Context, fetchParams bridgev
 		HasMore:  len(backfillMessages) > 0,
 		Forward:  fetchParams.Forward,
 		MarkRead: markRead,
+
+		CompleteCallback: func() {
+			stateCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+			defer cancel()
+			for _, raw := range messages {
+				if message, ok := raw.(*tg.Message); ok {
+					tc.initializeRoundMediaState(stateCtx, portal, message)
+				}
+			}
+		},
 
 		AggressiveDeduplication: aggressiveDedup,
 	}, nil

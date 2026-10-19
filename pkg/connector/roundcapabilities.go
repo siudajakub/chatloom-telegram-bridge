@@ -83,7 +83,7 @@ func roundFileCapability(allowed *bool, limit *int64) *event.FileFeatures {
 		MimeTypes: map[string]event.CapabilitySupportLevel{"video/mp4": level},
 		Caption:   event.CapLevelRejected,
 		MaxWidth:  roundMaxDimension, MaxHeight: roundMaxDimension,
-		MaxDuration: ptr.Ptr(jsontime.S(60 * time.Second)), ViewOnce: false,
+		MaxDuration: ptr.Ptr(jsontime.S(60 * time.Second)),
 	}
 	if limit != nil {
 		capability.MaxSize = *limit
