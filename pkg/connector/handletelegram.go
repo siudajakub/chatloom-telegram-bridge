@@ -234,6 +234,9 @@ func (tc *TelegramClient) onUpdateNewMessage(ctx context.Context, entities tg.En
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventMessage,
 				LogContext: func(c zerolog.Context) zerolog.Context {
+					if isRoundMedia(msg.Media) {
+						return c.Str("media_type", "round_video")
+					}
 					return c.
 						Int("message_id", msg.GetID()).
 						Str("sender", string(sender.Sender)).
@@ -241,11 +244,12 @@ func (tc *TelegramClient) onUpdateNewMessage(ctx context.Context, entities tg.En
 						Bool("is_from_me", sender.IsFromMe).
 						Stringer("peer_id", msg.PeerID)
 				},
-				Sender:       sender,
-				PortalKey:    tc.makePortalKeyFromPeer(msg.PeerID, topicID),
-				CreatePortal: true,
-				Timestamp:    time.Unix(int64(msg.Date), 0),
-				StreamOrder:  int64(msg.GetID()),
+				Sender:         sender,
+				PortalKey:      tc.makePortalKeyFromPeer(msg.PeerID, topicID),
+				CreatePortal:   true,
+				Timestamp:      time.Unix(int64(msg.Date), 0),
+				StreamOrder:    int64(msg.GetID()),
+				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) { tc.initializeRoundMediaState(ctx, portal, msg) },
 			},
 			ID:                 ids.GetMessageIDFromMessage(msg),
 			Data:               msg,
@@ -931,22 +935,22 @@ func (tc *TelegramClient) onUpdateWrapper(ctx context.Context, e tg.Entities, up
 }
 
 func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.UpdateClass) error {
-	zerolog.Ctx(ctx).Trace().Stringer("update", upd).Msg("Raw update")
+	zerolog.Ctx(ctx).Trace().Type("update_type", upd).Msg("Telegram update type")
 	for userID, user := range e.Users {
-		zerolog.Ctx(ctx).Trace().Stringer("user", user).Msg("Raw user info in update")
+		zerolog.Ctx(ctx).Trace().Type("user_type", user).Msg("Telegram user update type")
 		if _, err := tc.updateGhost(ctx, userID, user); err != nil {
 			return err
 		}
 	}
 	for chatID, chat := range e.Chats {
-		zerolog.Ctx(ctx).Trace().Stringer("chat", chat).Msg("Raw chat info in update")
+		zerolog.Ctx(ctx).Trace().Type("chat_type", chat).Msg("Telegram chat update type")
 		if chat.GetLeft() {
 			// TODO don't ignore errors
 			tc.selfLeaveChat(ctx, tc.makePortalKeyFromID(ids.PeerTypeChat, chatID, 0), fmt.Errorf("left flag in entity update"))
 		}
 	}
 	for _, channel := range e.Channels {
-		zerolog.Ctx(ctx).Trace().Stringer("channel", channel).Msg("Raw channel info in update")
+		zerolog.Ctx(ctx).Trace().Type("channel_type", channel).Msg("Telegram channel update type")
 		if channel.GetLeft() {
 			tc.selfLeaveChat(ctx, tc.makePortalKeyFromID(ids.PeerTypeChannel, channel.ID, 0), fmt.Errorf("left flag in entity update"))
 		}
@@ -985,6 +989,10 @@ func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.Up
 		return tc.handleTyping(tc.makePortalKeyFromID(ids.PeerTypeChat, update.ChatID, 0), tc.getPeerSender(update.FromID), update.Action)
 	case *tg.UpdateChannelUserTyping:
 		return tc.handleTyping(tc.makePortalKeyFromID(ids.PeerTypeChannel, update.ChannelID, update.TopMsgID), tc.getPeerSender(update.FromID), update.Action)
+	case *tg.UpdateReadMessagesContents:
+		return tc.onRoundContentsRead(ctx, 0, update.Messages)
+	case *tg.UpdateChannelReadMessagesContents:
+		return tc.onRoundContentsRead(ctx, update.ChannelID, update.Messages)
 	case *tg.UpdateReadHistoryOutbox:
 		return tc.updateReadReceipt(ctx, e, update)
 	case *tg.UpdateReadHistoryInbox:
@@ -1284,10 +1292,14 @@ func (tc *TelegramClient) getAppConfigCached(ctx context.Context) (map[string]an
 	}
 	tc.appConfigLock.Lock()
 	defer tc.appConfigLock.Unlock()
-	if tc.appConfig == nil {
+	if tc.appConfig == nil || (!tc.appConfigFetched.IsZero() && time.Since(tc.appConfigFetched) > 5*time.Minute) {
 		cfg, err := tc.client.API().HelpGetAppConfig(ctx, tc.appConfigHash)
 		if err != nil {
 			return nil, err
+		}
+		if _, unchanged := cfg.(*tg.HelpAppConfigNotModified); unchanged && tc.appConfig != nil {
+			tc.appConfigFetched = time.Now()
+			return tc.appConfig, nil
 		}
 		appConfig, ok := cfg.(*tg.HelpAppConfig)
 		if !ok {
@@ -1302,6 +1314,7 @@ func (tc *TelegramClient) getAppConfigCached(ctx context.Context) (map[string]an
 			return nil, fmt.Errorf("failed to parse app config: unexpected type %T", tc.appConfig)
 		}
 		tc.appConfigHash = appConfig.Hash
+		tc.appConfigFetched = time.Now()
 	}
 	return tc.appConfig, nil
 }

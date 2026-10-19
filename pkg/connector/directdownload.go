@@ -18,6 +18,7 @@ package connector
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/rs/zerolog"
@@ -85,7 +86,7 @@ func (tc *TelegramClient) refetchMedia(ctx context.Context, peerType ids.PeerTyp
 	} else if msg.ID != msgID {
 		return nil, fmt.Errorf("no media found with ID %d", msgID)
 	} else {
-		return msg.Media, nil
+		return safeRefetchedMedia(msg, peerType, peerID, messages.GetChats())
 	}
 }
 
@@ -96,10 +97,9 @@ func (tc *TelegramConnector) Download(ctx context.Context, mediaID networkid.Med
 	}
 	log := zerolog.Ctx(ctx).With().
 		Str("component", "direct download").
-		Any("info", info).
 		Logger()
 	ctx = log.WithContext(ctx)
-	log.Info().Any("info", info).Msg("handling direct download")
+	log.Info().Msg("handling direct download")
 
 	// TODO have an in-memory cache for media references?
 
@@ -152,6 +152,9 @@ func (tc *TelegramConnector) Download(ctx context.Context, mediaID networkid.Med
 	} else if info.MessageID > 0 {
 		rawMsgMedia, err := client.refetchMedia(ctx, info.PeerType, info.PeerID, int(info.MessageID))
 		if err != nil {
+			if errors.Is(err, errRestrictedMedia) {
+				return nil, mautrix.MForbidden.WithMessage("Restricted media must be opened in Telegram")
+			}
 			return nil, fmt.Errorf("failed to refetch media message: %w", err)
 		}
 

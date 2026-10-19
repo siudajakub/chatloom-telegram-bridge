@@ -87,6 +87,9 @@ func (tc *TelegramClient) mediaToMatrix(
 	intent bridgev2.MatrixAPI,
 	msg *tg.Message,
 ) (*bridgev2.ConvertedMessagePart, *database.DisappearingSetting, []byte) {
+	if policy := mediaPolicyForMessage(portal, msg); !policy.TransferAllowed {
+		return blockedMediaPart(policy), nil, nil
+	}
 	media, ok := msg.GetMedia()
 	if !ok {
 		return nil, nil, nil
@@ -153,6 +156,25 @@ func (tc *TelegramClient) convertToMatrix(
 ) (cm *bridgev2.ConvertedMessage, err error) {
 	log := zerolog.Ctx(ctx).With().Str("conversion_direction", "to_matrix").Logger()
 	ctx = log.WithContext(ctx)
+
+	// TTL and message-level protection already prohibit any ordinary export.
+	// Otherwise refresh current chat protection centrally for live messages,
+	// edits and history before a cached false can authorize a media transfer.
+	if messageNeedsMediaTransfer(msg) && !msg.Noforwards && tc.client != nil {
+		ttlPresent := false
+		if ttlMedia, ok := msg.Media.(ttlable); ok {
+			_, ttlPresent = ttlMedia.GetTTLSeconds()
+		}
+		if !ttlPresent {
+			if err := tc.refreshRoundSourceProtection(ctx, portal); err != nil {
+				log.Warn().Msg("Unable to verify Telegram content protection; blocking media")
+			}
+		}
+	}
+	policy := mediaPolicyForMessage(portal, msg)
+	if !policy.TransferAllowed {
+		return blockedMediaMessage(portal, msg, policy), nil
+	}
 
 	if tc.client == nil {
 		return nil, fmt.Errorf("telegram client is nil, we are likely logged out")
@@ -251,8 +273,14 @@ func (tc *TelegramClient) convertToMatrix(
 		cm.Parts[0].Content.AddPerMessageProfileFallback()
 	}
 	cm.Parts[0].DBMetadata = &MessageMetadata{
-		ContentHash: hasher.Sum(nil),
-		ContentURI:  contentURI,
+		ContentHash:     hasher.Sum(nil),
+		ContentURI:      contentURI,
+		IsRound:         isRoundMedia(msg.Media),
+		MediaUnread:     roundMediaUnread(msg),
+		NoForwards:      policy.ProtectedContent != nil && *policy.ProtectedContent,
+		ProtectionKnown: policy.ProtectedContent != nil,
+		TTLSeconds:      policyTTLSeconds(policy),
+		MediaPolicy:     policy,
 	}
 
 	if fwd, isForwarded := msg.GetFwdFrom(); isForwarded {
@@ -291,6 +319,7 @@ func (tc *TelegramClient) convertToMatrix(
 	if cm.Parts[0].Extra == nil {
 		cm.Parts[0].Extra = make(map[string]any)
 	}
+	cm.Parts[0].Extra[mediaPolicyKey] = policy
 	if externalURL := getMessageLink(msg); externalURL != "" {
 		cm.Parts[0].Extra["external_url"] = externalURL
 	}
@@ -469,6 +498,9 @@ func (tc *TelegramClient) parseRichText(ctx context.Context, message *tg.RichMes
 }
 
 func (tc *TelegramClient) webpageToBeeperLinkPreview(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *tg.Message, msgMedia tg.MessageMediaClass) (preview *event.BeeperLinkPreview, err error) {
+	if policy := mediaPolicyForMessage(portal, msg); !policy.TransferAllowed {
+		return nil, errRestrictedMedia
+	}
 	webpage, ok := msgMedia.(*tg.MessageMediaWebPage).Webpage.(*tg.WebPage)
 	if !ok {
 		return nil, nil
@@ -533,6 +565,10 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 	msgMedia tg.MessageMediaClass,
 	allowRefetch bool,
 ) (converted *bridgev2.ConvertedMessagePart, disappearingSetting *database.DisappearingSetting) {
+	// Check before creating transferers, touching the cache, or exposing thumbnails.
+	if policy := mediaPolicyForMessage(portal, &tg.Message{Media: msgMedia}); !policy.TransferAllowed {
+		return blockedMediaPart(policy), nil
+	}
 	log := zerolog.Ctx(ctx).With().
 		Str("conversion_direction", "to_matrix").
 		Str("portal_id", string(portal.ID)).
@@ -553,37 +589,6 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 	if unwrapped := unwrapWebPage(msgMedia); unwrapped != nil {
 		msgMedia = unwrapped
 		isWebPage = true
-	}
-
-	if t, ok := msgMedia.(ttlable); ok {
-		if ttl, ok := t.GetTTLSeconds(); ok {
-			typeName := "photo"
-			if msgMedia.TypeID() == tg.MessageMediaDocumentTypeID {
-				typeName = "file"
-			}
-
-			if ttl == 2147483647 {
-				// This is a view-once message, set a low TTL.
-				ttl = 15
-
-				if tc.main.Config.DisableViewOnce {
-					converted = &bridgev2.ConvertedMessagePart{
-						Type: event.EventMessage,
-						Content: &event.MessageEventContent{
-							MsgType: event.MsgNotice,
-							Body:    fmt.Sprintf("You received a view once %s. For added privacy, you can only open it on the Telegram app.", typeName),
-						},
-					}
-					return
-				}
-			}
-
-			disappearingSetting = &database.DisappearingSetting{
-				// Even though normal message TTLs are after send, media is after read
-				Type:  event.DisappearingTypeAfterRead,
-				Timer: time.Duration(ttl) * time.Second,
-			}
-		}
 	}
 
 	// Determine the filename and some other information
