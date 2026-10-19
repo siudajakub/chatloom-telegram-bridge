@@ -18,6 +18,7 @@ package connector
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 
 	"go.mau.fi/util/exsync"
@@ -56,6 +57,10 @@ func (gm *GhostMetadata) IsMin() bool {
 }
 
 type PortalMetadata struct {
+	roundPermissionLock sync.RWMutex
+	ProtectedContent    *bool                       `json:"protected_content,omitempty"`
+	RoundPermissions    map[string]*RoundPermission `json:"round_permissions,omitempty"`
+
 	IsSuperGroup      bool          `json:"is_supergroup,omitempty"`
 	IsForumGeneral    bool          `json:"is_forum_general,omitempty"`
 	IsCommunity       bool          `json:"is_community,omitempty"`
@@ -72,6 +77,15 @@ type PortalMetadata struct {
 
 	sponsoredMessageLock sync.Mutex
 	sponsoredMessageSeen *exsync.Set[int64]
+}
+
+// MarshalJSON protects the account permission map against concurrent capability
+// snapshots while a custom control refreshes its own account policy.
+func (pm *PortalMetadata) MarshalJSON() ([]byte, error) {
+	pm.roundPermissionLock.RLock()
+	defer pm.roundPermissionLock.RUnlock()
+	type plain PortalMetadata
+	return json.Marshal((*plain)(pm))
 }
 
 func (pm *PortalMetadata) SetIsSuperGroup(isSupergroup bool) (changed bool) {
@@ -93,9 +107,17 @@ func (pm *PortalMetadata) SetIsForumGeneral(isForumGeneral bool) (changed bool) 
 }
 
 type MessageMetadata struct {
-	ViewLimited *event.BeeperViewLimitedMedia `json:"view_limited,omitempty"`
-	ContentHash []byte                        `json:"content_hash,omitempty"`
-	ContentURI  id.ContentURIString           `json:"content_uri,omitempty"`
+	ViewLimited     *event.BeeperViewLimitedMedia `json:"view_limited,omitempty"`
+	IsRound         bool                          `json:"is_round,omitempty"`
+	MediaUnread     *bool                         `json:"media_unread,omitempty"`
+	NoForwards      bool                          `json:"no_forwards,omitempty"`
+	TTLSeconds      int                           `json:"ttl_seconds,omitempty"`
+	MediaExpired    bool                          `json:"media_expired,omitempty"`
+	ProtectionKnown bool                          `json:"protection_known,omitempty"`
+	MediaPolicy     *TelegramMediaPolicy          `json:"media_policy,omitempty"`
+
+	ContentHash []byte              `json:"content_hash,omitempty"`
+	ContentURI  id.ContentURIString `json:"content_uri,omitempty"`
 }
 
 type UserLoginMetadata struct {

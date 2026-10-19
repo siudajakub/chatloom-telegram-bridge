@@ -31,8 +31,9 @@ type TelegramConnector struct {
 	Config TelegramConfig
 	Store  *store.Container
 
-	useDirectMedia bool
-	maxFileSize    int64
+	useDirectMedia       bool
+	maxFileSize          int64
+	mediaControlsEnabled bool
 }
 
 var _ bridgev2.NetworkConnector = (*TelegramConnector)(nil)
@@ -41,6 +42,7 @@ var _ bridgev2.MaxFileSizeingNetwork = (*TelegramConnector)(nil)
 func (tc *TelegramConnector) Init(bridge *bridgev2.Bridge) {
 	tc.Store = store.NewStore(bridge.DB.Database, dbutil.ZeroLogger(bridge.Log.With().Str("db_section", "telegram").Logger()))
 	tc.Bridge = bridge
+	tc.RegisterMediaControlHandlers()
 	tc.Bridge.Commands.(*commands.Processor).AddHandlers(cmdSyncChats, cmdEmojiPack, cmdUpgrade, cmdJoin)
 }
 

@@ -87,9 +87,11 @@ type TelegramClient struct {
 	clientInitialized *exsync.Event
 	mu                sync.Mutex
 
-	appConfigLock sync.Mutex
-	appConfig     map[string]any
-	appConfigHash int
+	roundCapabilityRefresh sync.Map
+	appConfigLock          sync.Mutex
+	appConfig              map[string]any
+	appConfigHash          int
+	appConfigFetched       time.Time
 
 	availableReactionsLock    sync.Mutex
 	availableReactions        exmaps.Set[string]
