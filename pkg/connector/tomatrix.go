@@ -98,7 +98,7 @@ func (tc *TelegramClient) mediaToMatrix(
 	switch media.TypeID() {
 	case tg.MessageMediaWebPageTypeID:
 		if tc.main.Config.VideoURLPreviewAsFile && unwrapWebPage(media) != nil {
-			converted, disappearingSetting := tc.convertMediaRequiringUpload(ctx, portal, intent, msg.ID, media, true)
+			converted, disappearingSetting := tc.convertMediaRequiringUpload(ctx, portal, intent, msg, media, true)
 			return converted, disappearingSetting, mediaHashID(ctx, media)
 		}
 		// Already handled in the message handling
@@ -115,7 +115,7 @@ func (tc *TelegramClient) mediaToMatrix(
 			},
 		}, nil, nil
 	case tg.MessageMediaPhotoTypeID, tg.MessageMediaDocumentTypeID:
-		converted, disappearingSetting := tc.convertMediaRequiringUpload(ctx, portal, intent, msg.ID, media, true)
+		converted, disappearingSetting := tc.convertMediaRequiringUpload(ctx, portal, intent, msg, media, true)
 		return converted, disappearingSetting, mediaHashID(ctx, media)
 	case tg.MessageMediaContactTypeID:
 		return tc.convertContact(media), nil, nil
@@ -281,6 +281,7 @@ func (tc *TelegramClient) convertToMatrix(
 		ProtectionKnown: policy.ProtectedContent != nil,
 		TTLSeconds:      policyTTLSeconds(policy),
 		MediaPolicy:     policy,
+		ViewLimited:     cm.Parts[0].Content.BeeperViewLimited,
 	}
 
 	if fwd, isForwarded := msg.GetFwdFrom(); isForwarded {
@@ -561,7 +562,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 	ctx context.Context,
 	portal *bridgev2.Portal,
 	intent bridgev2.MatrixAPI,
-	msgID int,
+	msg *tg.Message,
 	msgMedia tg.MessageMediaClass,
 	allowRefetch bool,
 ) (converted *bridgev2.ConvertedMessagePart, disappearingSetting *database.DisappearingSetting) {
@@ -569,6 +570,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 	if policy := mediaPolicyForMessage(portal, &tg.Message{Media: msgMedia}); !policy.TransferAllowed {
 		return blockedMediaPart(policy), nil
 	}
+	msgID := msg.ID
 	log := zerolog.Ctx(ctx).With().
 		Str("conversion_direction", "to_matrix").
 		Str("portal_id", string(portal.ID)).
@@ -591,11 +593,43 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 		isWebPage = true
 	}
 
+	if t, ok := msgMedia.(ttlable); ok && !msg.Out {
+		if ttl, ok := t.GetTTLSeconds(); ok && ttl > 0 {
+			if tc.main.Bridge.Config.ViewLimitedMedia {
+				content.BeeperViewLimited = telegramViewLimit(ttl)
+			} else {
+				if ttl == telegramViewOnceTTL {
+					if tc.main.Config.DisableViewOnce {
+						typeName := "photo"
+						if msgMedia.TypeID() == tg.MessageMediaDocumentTypeID {
+							typeName = "file"
+						}
+						converted = &bridgev2.ConvertedMessagePart{
+							Type: event.EventMessage,
+							Content: &event.MessageEventContent{
+								MsgType: event.MsgNotice,
+								Body:    fmt.Sprintf("You received a view once %s. For added privacy, you can only open it on the Telegram app.", typeName),
+							},
+						}
+						return
+					}
+					// Set a low TTL for view-once media
+					ttl = 15
+				}
+				disappearingSetting = &database.DisappearingSetting{
+					// Even though normal message TTLs are after send, media is after read
+					Type:  event.DisappearingTypeAfterRead,
+					Timer: time.Duration(ttl) * time.Second,
+				}
+			}
+		}
+	}
+
 	// Determine the filename and some other information
 	switch msgMedia := msgMedia.(type) {
 	case *tg.MessageMediaPhoto:
 		content.MsgType = event.MsgImage
-		if disappearingSetting != nil {
+		if content.BeeperViewLimited != nil {
 			content.Body = "disappearing_image"
 		} else {
 			content.Body = "image"
@@ -808,7 +842,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 				} else if msgMedia, err = tc.refetchMedia(ctx, peerType, peerID, msgID); err != nil {
 					log.Err(err).Msg("Failed to refetch media after file reference expired error")
 				} else {
-					return tc.convertMediaRequiringUpload(ctx, portal, intent, msgID, msgMedia, false)
+					return tc.convertMediaRequiringUpload(ctx, portal, intent, msg, msgMedia, false)
 				}
 			} else {
 				log.Err(err).Msg("Failed to transfer media")

@@ -94,18 +94,13 @@ func adminRightsToPowerLevel(rights tg.ChatAdminRights) *int {
 	return otherPowerLevel
 }
 
-func (tc *TelegramClient) getDMChatInfo(ctx context.Context, userID int64) (*bridgev2.ChatInfo, error) {
-	ghost, err := tc.main.Bridge.GetGhostByID(ctx, ids.MakeUserID(userID))
-	if err != nil {
-		return nil, err
-	}
-
+func (tc *TelegramClient) getDMChatInfo(userID int64) (*bridgev2.ChatInfo, error) {
 	chatInfo := bridgev2.ChatInfo{
 		Type: ptr.Ptr(database.RoomTypeDM),
 		Members: &bridgev2.ChatMemberList{
 			IsFull:      true,
 			MemberMap:   map[networkid.UserID]bridgev2.ChatMember{},
-			PowerLevels: tc.getDMPowerLevels(ghost),
+			PowerLevels: tc.getDMPowerLevels(),
 		},
 		CanBackfill: !tc.metadata.IsBot,
 		ExtraUpdates: func(ctx context.Context, portal *bridgev2.Portal) bool {
@@ -570,7 +565,7 @@ func (tc *TelegramClient) getChatInfo(ctx context.Context, portal *bridgev2.Port
 
 	switch peerType {
 	case ids.PeerTypeUser:
-		return tc.getDMChatInfo(ctx, id)
+		return tc.getDMChatInfo(id)
 	case ids.PeerTypeChat:
 		fullChat, err := APICallWithUpdates(ctx, tc, func() (*tg.MessagesChatFull, error) {
 			return tc.client.API().MessagesGetFullChat(ctx, id)
@@ -655,15 +650,10 @@ func getTopicInfoFromResponse(resp *tg.MessagesForumTopics, channelID int64, top
 	return
 }
 
-func (tc *TelegramClient) getDMPowerLevels(ghost *bridgev2.Ghost) *bridgev2.PowerLevelOverrides {
+func (tc *TelegramClient) getDMPowerLevels() *bridgev2.PowerLevelOverrides {
 	var plo bridgev2.PowerLevelOverrides
-	// TODO use per-login metadata for blocked status
-	if /*ghost.Metadata.(*GhostMetadata).Blocked*/ false {
-		// Don't allow sending messages to blocked users
-		plo.EventsDefault = superadminPowerLevel
-	} else {
-		plo.EventsDefault = anyonePowerLevel
-	}
+	plo.Redact = anyonePowerLevel
+	plo.EventsDefault = anyonePowerLevel
 	plo.Events = map[event.Type]int{
 		event.StateRoomName:                0,
 		event.StateRoomAvatar:              0,

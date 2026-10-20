@@ -1,6 +1,6 @@
--- v9 -> v10 (compatible with v2+): Durable round media operations and playback state
+-- v10 -> v11 (compatible with v2+): Durable round media operations and playback state
 
-CREATE TABLE telegram_round_operation (
+CREATE TABLE IF NOT EXISTS telegram_round_operation (
     bridge_id TEXT NOT NULL,
     login_id TEXT NOT NULL,
     portal_id TEXT NOT NULL,
@@ -22,7 +22,7 @@ CREATE TABLE telegram_round_operation (
     UNIQUE (bridge_id, login_id, action, event_id)
 );
 
-CREATE TABLE telegram_round_media_state (
+CREATE TABLE IF NOT EXISTS telegram_round_media_state (
     bridge_id TEXT NOT NULL,
     login_id TEXT NOT NULL,
     portal_id TEXT NOT NULL,

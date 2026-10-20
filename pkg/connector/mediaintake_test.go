@@ -114,7 +114,7 @@ func TestRestrictedConversionEntrypointsCannotBypassGuard(t *testing.T) {
 	require.Equal(t, event.MsgNotice, part.Content.MsgType)
 	require.Nil(t, timer)
 	require.Nil(t, hash)
-	part, timer = client.convertMediaRequiringUpload(context.Background(), portal, nil, msg.ID, media, true)
+	part, timer = client.convertMediaRequiringUpload(context.Background(), portal, nil, msg, media, true)
 	require.Equal(t, event.MsgNotice, part.Content.MsgType)
 	require.Nil(t, timer)
 	preview, err := client.webpageToBeeperLinkPreview(context.Background(), portal, nil, msg, &tg.MessageMediaWebPage{})

@@ -29,6 +29,7 @@ import (
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/exfmt"
 	"go.mau.fi/util/exmaps"
+	"go.mau.fi/util/jsontime"
 	"go.mau.fi/util/ptr"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -199,6 +200,63 @@ func (tc *TelegramClient) onUpdateChannel(ctx context.Context, e tg.Entities, up
 	return resultToError(res)
 }
 
+func telegramViewLimit(ttl int) *event.BeeperViewLimitedMedia {
+	if ttl == telegramViewOnceTTL {
+		return &event.BeeperViewLimitedMedia{Type: "count", Count: 1}
+	} else if ttl > 0 {
+		return &event.BeeperViewLimitedMedia{Type: "time", Time: jsontime.MS(time.Duration(ttl) * time.Second)}
+	}
+	return nil
+}
+
+func (tc *TelegramClient) onViewLimitedMediaRead(ctx context.Context, update *tg.UpdateReadMessagesContents) (err error) {
+	viewedAt := time.Now()
+	if date, ok := update.GetDate(); ok && date > 0 {
+		viewedAt = time.Unix(int64(date), 0)
+	}
+	for _, msgID := range update.Messages {
+		messageID := ids.MakeMessageID(int64(0), msgID)
+		portalKey, ok := tc.recentMessageRooms.Get(messageID)
+		if !ok {
+			msg, dbErr := tc.main.Bridge.DB.Message.GetFirstPartByID(ctx, tc.loginID, messageID)
+			if dbErr != nil {
+				err = errors.Join(err, dbErr)
+				continue
+			} else if msg == nil {
+				continue
+			}
+			portalKey = msg.Room
+		}
+		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.EventMeta{
+			Type:      bridgev2.RemoteEventUnknown,
+			PortalKey: portalKey,
+			PreHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) {
+				msg, dbErr := tc.main.Bridge.DB.Message.GetFirstPartByID(ctx, tc.loginID, messageID)
+				if dbErr != nil {
+					zerolog.Ctx(ctx).Err(dbErr).Msg("Failed to get viewed media")
+					return
+				} else if msg == nil || msg.SenderID == tc.userID {
+					return
+				}
+				limit := msg.Metadata.(*MessageMetadata).ViewLimited
+				if limit == nil {
+					return
+				}
+				if addErr := tc.main.Bridge.DisappearLoop.Add(ctx, &database.DisappearingMessage{
+					RoomID: portal.MXID, EventID: msg.MXID, Timestamp: msg.Timestamp,
+					DisappearingSetting: database.DisappearingSetting{
+						Type: "view_limited", DisappearAt: viewedAt.Add(limit.Time.Duration),
+					},
+				}); addErr != nil {
+					zerolog.Ctx(ctx).Err(addErr).Msg("Failed to queue viewed media expiry")
+				}
+			},
+		})
+		err = errors.Join(err, resultToError(res))
+	}
+	return err
+}
+
 func (tc *TelegramClient) onUpdateNewMessage(ctx context.Context, entities tg.Entities, update IGetMessage) error {
 	log := *zerolog.Ctx(ctx)
 	switch msg := update.GetMessage().(type) {
@@ -230,6 +288,8 @@ func (tc *TelegramClient) onUpdateNewMessage(ctx context.Context, entities tg.En
 		}
 
 		topicID := tc.getTopicID(ctx, msg.PeerID, msg.ReplyTo)
+		portalKey := tc.makePortalKeyFromPeer(msg.PeerID, topicID)
+		msgID := ids.GetMessageIDFromMessage(msg)
 		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.Message[*tg.Message]{
 			EventMeta: simplevent.EventMeta{
 				Type: bridgev2.RemoteEventMessage,
@@ -245,16 +305,17 @@ func (tc *TelegramClient) onUpdateNewMessage(ctx context.Context, entities tg.En
 						Stringer("peer_id", msg.PeerID)
 				},
 				Sender:         sender,
-				PortalKey:      tc.makePortalKeyFromPeer(msg.PeerID, topicID),
+				PortalKey:      portalKey,
 				CreatePortal:   true,
 				Timestamp:      time.Unix(int64(msg.Date), 0),
 				StreamOrder:    int64(msg.GetID()),
 				PostHandleFunc: func(ctx context.Context, portal *bridgev2.Portal) { tc.initializeRoundMediaState(ctx, portal, msg) },
 			},
-			ID:                 ids.GetMessageIDFromMessage(msg),
+			ID:                 msgID,
 			Data:               msg,
 			ConvertMessageFunc: tc.convertToMatrix,
 		})
+		tc.recentMessageRooms.Push(msgID, portalKey)
 
 		if err := resultToError(res); err != nil {
 			return err
@@ -265,8 +326,9 @@ func (tc *TelegramClient) onUpdateNewMessage(ctx context.Context, entities tg.En
 		}
 		return nil
 	case *tg.MessageService:
-		return tc.handleServiceMessage(ctx, msg)
-
+		err := tc.handleServiceMessage(ctx, msg)
+		tc.recentMessageRooms.Push(ids.GetMessageIDFromMessage(msg), tc.makePortalKeyFromPeer(msg.PeerID, tc.getTopicID(ctx, msg.PeerID, msg.ReplyTo)))
+		return err
 	default:
 		log.Warn().
 			Type("action_type", msg).
@@ -612,14 +674,29 @@ func (tc *TelegramClient) handleServiceMessage(ctx context.Context, msg *tg.Mess
 			Int64("channel_id", action.ChannelID).
 			Msg("MessageActionChatMigrateTo")
 		newPortalKey := tc.makePortalKeyFromID(ids.PeerTypeChannel, action.ChannelID, 0)
+		tc.chatMigrateSender.Set(action.ChannelID, sender)
 		if err := tc.migrateChat(ctx, eventMeta.PortalKey, newPortalKey); err != nil {
 			log.Err(err).Msg("Failed to migrate chat to channel")
 			return err
 		}
+		return nil
+
+	case *tg.MessageActionChannelMigrateFrom:
+		oldPortalKey := tc.makePortalKeyFromID(ids.PeerTypeChat, action.ChatID, 0)
+		if err := tc.migrateChat(ctx, oldPortalKey, eventMeta.PortalKey); err != nil {
+			return err
+		}
+		// We want the message id of MigrateFrom with the sender of MigrateTo,
+		// because MigrateFrom has no sender and MigrateTo has a message ID in the old scope.
+		ch, ok := msg.PeerID.(*tg.PeerChannel)
+		if ok {
+			senderOverride, ok := tc.chatMigrateSender.Pop(ch.ChannelID)
+			if ok {
+				eventMeta = eventMeta.WithSender(senderOverride)
+			}
+		}
 		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.Message[any]{
 			EventMeta: eventMeta.
-				WithPortalKey(newPortalKey).
-				WithStreamOrder(0).
 				WithType(bridgev2.RemoteEventMessage),
 			ID: ids.GetMessageIDFromMessage(msg),
 			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data any) (*bridgev2.ConvertedMessage, error) {
@@ -629,6 +706,10 @@ func (tc *TelegramClient) handleServiceMessage(ctx context.Context, msg *tg.Mess
 						Content: &event.MessageEventContent{
 							MsgType: event.MsgNotice,
 							Body:    "Upgraded this group to a supergroup",
+
+							BeeperActionMessage: &event.BeeperActionMessage{
+								Type: "telegram_supergroup_upgrade",
+							},
 						},
 					}},
 				}, nil
@@ -669,6 +750,16 @@ func (tc *TelegramClient) handleServiceMessage(ctx context.Context, msg *tg.Mess
 }
 
 func (tc *TelegramClient) migrateChat(ctx context.Context, oldPortalKey, newPortalKey networkid.PortalKey) error {
+	if affected, err := tc.main.Store.NamespaceMigratedMessages(ctx, tc.main.Bridge.ID, oldPortalKey); err != nil {
+		return fmt.Errorf("failed to namespace pre-migration messages: %w", err)
+	} else if affected > 0 {
+		zerolog.Ctx(ctx).Debug().
+			Stringer("old_portal_key", oldPortalKey).
+			Stringer("new_portal_key", newPortalKey).
+			Int64("affected_messages", affected).
+			Msg("Namespaced messages from pre-migration minigroup")
+	}
+
 	if tc.main.Config.AlwaysTombstoneOnSupergroupMigration {
 		newPortal, err := tc.main.Bridge.GetPortalByKey(ctx, newPortalKey)
 		if err != nil {
@@ -967,6 +1058,8 @@ func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.Up
 		return tc.onUpdateChannel(ctx, e, update)
 	case *tg.UpdateUserName:
 		return tc.onUserName(ctx, e, update)
+	case *tg.UpdateReadMessagesContents:
+		return errors.Join(tc.onViewLimitedMediaRead(ctx, update), tc.onRoundContentsRead(ctx, 0, update.Messages))
 	case *tg.UpdateDeleteMessages:
 		return tc.onDeleteMessages(ctx, 0, update)
 	case *tg.UpdateDeleteChannelMessages:
@@ -989,8 +1082,6 @@ func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.Up
 		return tc.handleTyping(tc.makePortalKeyFromID(ids.PeerTypeChat, update.ChatID, 0), tc.getPeerSender(update.FromID), update.Action)
 	case *tg.UpdateChannelUserTyping:
 		return tc.handleTyping(tc.makePortalKeyFromID(ids.PeerTypeChannel, update.ChannelID, update.TopMsgID), tc.getPeerSender(update.FromID), update.Action)
-	case *tg.UpdateReadMessagesContents:
-		return tc.onRoundContentsRead(ctx, 0, update.Messages)
 	case *tg.UpdateChannelReadMessagesContents:
 		return tc.onRoundContentsRead(ctx, update.ChannelID, update.Messages)
 	case *tg.UpdateReadHistoryOutbox:
@@ -1580,37 +1671,23 @@ func (tc *TelegramClient) onChatDefaultBannedRights(ctx context.Context, entitie
 }
 
 func (tc *TelegramClient) onPeerBlocked(ctx context.Context, e tg.Entities, update *tg.UpdatePeerBlocked) error {
-	// TODO fix this after adding storage for block status (getDMPowerLevels also needs updating)
-	if true {
+	if update.BlockedMyStoriesFrom {
 		return nil
 	}
-	var userID networkid.UserID
-	if peer, ok := update.PeerID.(*tg.PeerUser); ok {
-		userID = ids.MakeUserID(peer.UserID)
-	} else {
-		zerolog.Ctx(ctx).Warn().Type("peer_type", update.PeerID).Msg("Unexpected peer type in peer blocked update")
+	if _, ok := update.PeerID.(*tg.PeerUser); !ok {
 		return nil
 	}
-
-	// Update the ghost
-	ghost, err := tc.main.Bridge.GetGhostByID(ctx, userID)
-	if err != nil {
-		return err
-	}
-
-	// Find portals that are DMs with the user
-	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatResync{
-		ChatInfo: &bridgev2.ChatInfo{
-			Members: &bridgev2.ChatMemberList{
-				PowerLevels: tc.getDMPowerLevels(ghost),
-			},
-			CanBackfill: true,
-		},
+	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.ChatInfoChange{
 		EventMeta: simplevent.EventMeta{
-			Type:      bridgev2.RemoteEventChatResync,
+			Type:      bridgev2.RemoteEventChatInfoChange,
 			PortalKey: tc.makePortalKeyFromPeer(update.PeerID, 0),
 			LogContext: func(c zerolog.Context) zerolog.Context {
 				return c.Str("tg_event", "updatePeerBlocked")
+			},
+		},
+		ChatInfoChange: &bridgev2.ChatInfoChange{
+			ChatInfo: &bridgev2.ChatInfo{
+				UserBlocked: &update.Blocked,
 			},
 		},
 	})
@@ -1652,7 +1729,7 @@ func (tc *TelegramClient) onPhoneCall(ctx context.Context, e tg.Entities, update
 				return c.Str("tg_event", "updatePhoneCall")
 			},
 		},
-		ID: networkid.MessageID(fmt.Sprintf("requested-%d", call.ID)),
+		ID: networkid.MessageID(fmt.Sprintf("call:requested-%d", call.ID)),
 		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data any) (*bridgev2.ConvertedMessage, error) {
 			return &bridgev2.ConvertedMessage{
 				Parts: []*bridgev2.ConvertedMessagePart{

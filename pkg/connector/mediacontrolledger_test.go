@@ -24,6 +24,9 @@ func TestRoundSendLedgerCachesResponseAndBindsSilentOptions(t *testing.T) {
 	defer raw.Close()
 	db, err := dbutil.NewWithDB(raw, "sqlite3")
 	require.NoError(t, err)
+	// Upstream store v10 updates the bridgev2 message table, which exists in real deployments.
+	_, err = raw.Exec("CREATE TABLE IF NOT EXISTS message (id TEXT NOT NULL, room_id TEXT NOT NULL)")
+	require.NoError(t, err)
 	network := &TelegramConnector{Bridge: &bridgev2.Bridge{ID: "synthetic-bridge"}, Store: store.NewStore(db, dbutil.NoopLogger)}
 	require.NoError(t, network.Store.Upgrade(ctx))
 	client := &TelegramClient{main: network, loginID: "synthetic-login"} // no API exists

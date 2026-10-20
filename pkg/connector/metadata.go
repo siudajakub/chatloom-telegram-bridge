@@ -26,6 +26,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-telegram/pkg/gotd/crypto"
@@ -106,13 +107,14 @@ func (pm *PortalMetadata) SetIsForumGeneral(isForumGeneral bool) (changed bool) 
 }
 
 type MessageMetadata struct {
-	IsRound         bool                 `json:"is_round,omitempty"`
-	MediaUnread     *bool                `json:"media_unread,omitempty"`
-	NoForwards      bool                 `json:"no_forwards,omitempty"`
-	TTLSeconds      int                  `json:"ttl_seconds,omitempty"`
-	MediaExpired    bool                 `json:"media_expired,omitempty"`
-	ProtectionKnown bool                 `json:"protection_known,omitempty"`
-	MediaPolicy     *TelegramMediaPolicy `json:"media_policy,omitempty"`
+	IsRound         bool                          `json:"is_round,omitempty"`
+	MediaUnread     *bool                         `json:"media_unread,omitempty"`
+	NoForwards      bool                          `json:"no_forwards,omitempty"`
+	TTLSeconds      int                           `json:"ttl_seconds,omitempty"`
+	MediaExpired    bool                          `json:"media_expired,omitempty"`
+	ProtectionKnown bool                          `json:"protection_known,omitempty"`
+	MediaPolicy     *TelegramMediaPolicy          `json:"media_policy,omitempty"`
+	ViewLimited     *event.BeeperViewLimitedMedia `json:"view_limited,omitempty"`
 
 	ContentHash []byte              `json:"content_hash,omitempty"`
 	ContentURI  id.ContentURIString `json:"content_uri,omitempty"`
@@ -125,9 +127,11 @@ type UserLoginMetadata struct {
 	Session     UserLoginSession `json:"session"`
 	TakeoutID   int64            `json:"takeout_id,omitempty"`
 
-	DialogSyncComplete bool               `json:"takeout_portal_crawl_done,omitempty"`
-	DialogSyncCursor   networkid.PortalID `json:"takeout_portal_crawl_cursor,omitempty"`
-	DialogSyncCount    int                `json:"dialog_sync_count,omitempty"`
+	DialogSyncComplete   bool               `json:"takeout_portal_crawl_done,omitempty"`
+	DialogSyncCursor     networkid.PortalID `json:"takeout_portal_crawl_cursor,omitempty"`
+	DialogSyncCount      int                `json:"dialog_sync_count,omitempty"`
+	DialogSyncOffsetID   int                `json:"dialog_sync_offset_id,omitempty"`
+	DialogSyncOffsetDate int                `json:"dialog_sync_offset_date,omitempty"`
 
 	PinnedDialogs []networkid.PortalID `json:"pinned_dialogs,omitempty"`
 
@@ -140,6 +144,8 @@ func (u *UserLoginMetadata) ResetOnLogout() {
 	u.DialogSyncComplete = false
 	u.DialogSyncCursor = networkid.PortalID("")
 	u.DialogSyncCount = 0
+	u.DialogSyncOffsetID = 0
+	u.DialogSyncOffsetDate = 0
 	u.PushEncryptionKey = nil
 }
 

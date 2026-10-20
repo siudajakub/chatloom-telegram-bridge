@@ -16,7 +16,7 @@ func TestRoundCapabilityFrozenV1(t *testing.T) {
 	allowed := true
 	limit := int64(16777216)
 	capability := roundFileCapability(&allowed, &limit)
-	if capability.MimeTypes["video/mp4"] != event.CapLevelFullySupported || capability.Caption != event.CapLevelRejected || capability.MaxWidth != 640 || capability.MaxHeight != 640 || capability.MaxDuration.Get() != 60*time.Second || capability.MaxSize != limit || capability.ViewOnce {
+	if capability.MimeTypes["video/mp4"] != event.CapLevelFullySupported || capability.Caption != event.CapLevelRejected || capability.MaxWidth != 640 || capability.MaxHeight != 640 || capability.MaxDuration.Get() != 60*time.Second || capability.MaxSize != limit || len(capability.ViewLimitedTypes) != 0 {
 		t.Fatal("file cap mismatch")
 	}
 	caps := makeMediaCapabilities("synthetic-login", "!synthetic:example.invalid", "synthetic-bridge", &allowed, "allowed", &limit)

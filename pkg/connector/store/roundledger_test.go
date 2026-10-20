@@ -21,6 +21,9 @@ func openRoundLedgerTestDB(t *testing.T, path string) (*RoundLedger, *sql.DB) {
 	raw.SetMaxOpenConns(1)
 	db, err := dbutil.NewWithDB(raw, "sqlite3")
 	require.NoError(t, err)
+	// Upstream store v10 updates the bridgev2 message table, which exists in real deployments.
+	_, err = raw.Exec("CREATE TABLE IF NOT EXISTS message (id TEXT NOT NULL, room_id TEXT NOT NULL)")
+	require.NoError(t, err)
 	c := NewStore(db, dbutil.NoopLogger)
 	require.NoError(t, c.Upgrade(context.Background()))
 	return NewRoundLedger(c.Database), raw

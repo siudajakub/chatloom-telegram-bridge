@@ -119,6 +119,9 @@ func integrationStore(t *testing.T, path string) (*store.Container, *sql.DB) {
 	raw.SetMaxOpenConns(1)
 	db, err := dbutil.NewWithDB(raw, "sqlite3")
 	require.NoError(t, err)
+	// Upstream store v10 updates the bridgev2 message table, which exists in real deployments.
+	_, err = raw.Exec("CREATE TABLE IF NOT EXISTS message (id TEXT NOT NULL, room_id TEXT NOT NULL)")
+	require.NoError(t, err)
 	container := store.NewStore(db, dbutil.NoopLogger)
 	require.NoError(t, container.Upgrade(context.Background()))
 	return container, raw

@@ -43,6 +43,7 @@ func TestTransfer(t *testing.T) {
 
 func TestTransferWithInvokeContextDC(t *testing.T) {
 	ctx := context.Background()
+
 	dc := 1
 	targetDC := dc
 	ctx = context.WithValue(ctx, InvokeContextKeyDC, &targetDC)
@@ -54,11 +55,17 @@ func TestTransferWithInvokeContextDC(t *testing.T) {
 		})
 		user := &tg.User{ID: 10, Username: "abc10"}
 		exported := bytes.Repeat([]byte{10}, 10)
-		a.ExpectCall(&tg.AuthExportAuthorizationRequest{DCID: dc}).ThenResult(&tg.AuthExportedAuthorization{
-			ID: user.ID, Bytes: exported,
+		a.ExpectCall(&tg.AuthExportAuthorizationRequest{
+			DCID: dc,
+		}).ThenResult(&tg.AuthExportedAuthorization{
+			ID:    user.ID,
+			Bytes: exported,
 		}).ExpectCall(&tg.AuthImportAuthorizationRequest{
-			ID: user.ID, Bytes: exported,
-		}).ThenResult(&tg.AuthAuthorization{User: user})
+			ID:    user.ID,
+			Bytes: exported,
+		}).ThenResult(&tg.AuthAuthorization{
+			User: user,
+		})
 
 		done := make(chan error, 1)
 		go func() {

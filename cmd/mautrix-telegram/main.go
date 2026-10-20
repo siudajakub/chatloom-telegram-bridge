@@ -17,17 +17,9 @@
 package main
 
 import (
-	"context"
-	"encoding/base64"
-	"fmt"
-
-	"go.mau.fi/util/dbutil/litestream"
-	"go.mau.fi/util/exerrors"
-	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/matrix/mxmain"
 
 	"go.mau.fi/mautrix-telegram/pkg/connector"
-	"go.mau.fi/mautrix-telegram/pkg/connector/store/upgrades"
 )
 
 // Information to find out exactly which commit the bridge was built from.
@@ -43,23 +35,13 @@ var m = mxmain.BridgeMain{
 	Name:        "mautrix-telegram",
 	URL:         "https://github.com/mautrix/telegram",
 	Description: "A Matrix-Telegram puppeting bridge.",
-	Version:     "26.09",
+	Version:     "26.10",
 	SemCalVer:   true,
 
 	Connector: c,
 }
 
-func init() {
-	litestream.Functions["encode"] = func(data []byte, encoding string) string {
-		if encoding == "base64" {
-			return base64.StdEncoding.EncodeToString(data)
-		}
-		panic(fmt.Errorf("unknown encoding %q", encoding))
-	}
-}
-
 func main() {
-	bridgeconfig.HackyMigrateLegacyNetworkConfig = migrateLegacyConfig
 	versionWithoutCommit := m.Version
 	m.PostInit = func() {
 		if c.Config.DeviceInfo.AppVersion == "auto" {
@@ -70,25 +52,6 @@ func main() {
 		}
 		if c.Config.DeviceInfo.DeviceModel == "auto" || c.Config.DeviceInfo.DeviceModel == "" {
 			c.Config.DeviceInfo.DeviceModel = "mautrix-telegram"
-		}
-		m.CheckLegacyDB(
-			18,
-			"v0.14.0",
-			"v26.04",
-			m.LegacyMigrateWithAnotherUpgrader(
-				legacyMigrateRenameTables, legacyMigrateCopyData, 27,
-				upgrades.Table, "telegram_version", 6,
-			),
-			true,
-		)
-		ctx := context.TODO()
-		if exists, _ := m.DB.TableExists(ctx, "telegram_file_old"); exists {
-			exerrors.Must(m.DB.Exec(ctx, `
-				PRAGMA foreign_keys = 'OFF';
-				DROP TABLE telegram_file_old;
-				PRAGMA foreign_key_check;
-				PRAGMA foreign_keys = 'ON';
-			`))
 		}
 	}
 	m.InitVersion(Tag, Commit, BuildTime)
