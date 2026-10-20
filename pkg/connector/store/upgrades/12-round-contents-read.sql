@@ -1,4 +1,4 @@
--- v10 -> v11 (compatible with v2+): Preserve contents-read updates before message mapping
+-- v11 -> v12 (compatible with v2+): Preserve contents-read updates before message mapping
 
 CREATE TABLE telegram_round_contents_read (
     bridge_id TEXT NOT NULL,

@@ -1,4 +1,4 @@
--- v9 -> v10 (compatible with v2+): Durable round media operations and playback state
+-- v10 -> v11 (compatible with v2+): Durable round media operations and playback state
 
 CREATE TABLE telegram_round_operation (
     bridge_id TEXT NOT NULL,

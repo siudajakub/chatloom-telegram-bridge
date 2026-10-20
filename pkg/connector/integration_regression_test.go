@@ -120,6 +120,9 @@ func integrationStore(t *testing.T, path string) (*store.Container, *sql.DB) {
 	db, err := dbutil.NewWithDB(raw, "sqlite3")
 	require.NoError(t, err)
 	container := store.NewStore(db, dbutil.NoopLogger)
+	// Store migration v10 rewrites bridgev2 message IDs; isolated store tests need the table.
+	_, err = db.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS message (id TEXT, room_id TEXT)")
+	require.NoError(t, err)
 	require.NoError(t, container.Upgrade(context.Background()))
 	return container, raw
 }

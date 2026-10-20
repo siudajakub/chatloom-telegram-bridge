@@ -25,6 +25,9 @@ func TestRoundSendLedgerCachesResponseAndBindsSilentOptions(t *testing.T) {
 	db, err := dbutil.NewWithDB(raw, "sqlite3")
 	require.NoError(t, err)
 	network := &TelegramConnector{Bridge: &bridgev2.Bridge{ID: "synthetic-bridge"}, Store: store.NewStore(db, dbutil.NoopLogger)}
+	// Store migration v10 rewrites bridgev2 message IDs; isolated store tests need the table.
+	_, err = db.Exec(context.Background(), "CREATE TABLE IF NOT EXISTS message (id TEXT, room_id TEXT)")
+	require.NoError(t, err)
 	require.NoError(t, network.Store.Upgrade(ctx))
 	client := &TelegramClient{main: network, loginID: "synthetic-login"} // no API exists
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "user:777", Receiver: "synthetic-login"}, MXID: "!synthetic-round:example.invalid"}}
