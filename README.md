@@ -1,3 +1,21 @@
+# ChatLoom Telegram bridge
+
+This is a fork of [mautrix-telegram](https://github.com/mautrix/telegram) used by
+[ChatLoom](https://github.com/siudajakub/chatloom). It adds:
+
+* Telegram round (circle) video messages in both directions, including echo,
+  reconcile, backfill and per-chat capability state;
+* Telegram GIF search for the client and GIF/TGS sticker capabilities;
+* a protection cache for chats with forwarding restrictions;
+* readable error messages for failed round sends.
+
+The default branch `chatloom/v1.2` is the build ChatLoom runs (based on
+upstream v26.10). It runs with Beeper's `bbctl` like the official bridge; see
+[Self-hosting ChatLoom](https://github.com/siudajakub/chatloom/blob/main/docs/SELF-HOSTING.md).
+The upstream README follows.
+
+---
+
 # mautrix-telegram
 ![Languages](https://img.shields.io/github/languages/top/mautrix/telegram.svg)
 [![License](https://img.shields.io/github/license/mautrix/telegram.svg)](LICENSE)
