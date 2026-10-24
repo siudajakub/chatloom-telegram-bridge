@@ -168,28 +168,36 @@ func (tc *TelegramClient) roundMessageAlreadyMapped(ctx context.Context, portal 
 	return err != nil || existing != nil
 }
 
+// roundContentHash is the content hash of a round as the incoming conversion
+// computes it (tomatrix.go: Telegram text, then the media ID), so the first
+// remote edit of an own round is recognised as unchanged (wave 5 F5).
+func roundContentHash(ctx context.Context, text string, media tg.MessageMediaClass) []byte {
+	hasher := sha256.New()
+	hasher.Write([]byte(text))
+	hasher.Write(mediaHashID(ctx, media))
+	return hasher.Sum(nil)
+}
+
 // roundMatrixResponse maps an accepted Telegram message ID like upstream does
 // for ordinary media, so the later update-stream echo deduplicates by ID.
-func (tc *TelegramClient) roundMatrixResponse(ctx context.Context, msg *bridgev2.MatrixMessage, tgMessageID, tgDate int, media tg.MessageMediaClass) *bridgev2.MatrixMessageResponse {
-	hasher := sha256.New()
-	hasher.Write([]byte(msg.Content.Body))
-	hasher.Write(mediaHashID(ctx, media))
+// text is the Telegram message text of the echo ("" when no echo is known;
+// video notes carry no caption).
+func (tc *TelegramClient) roundMatrixResponse(ctx context.Context, msg *bridgev2.MatrixMessage, tgMessageID, tgDate int, text string, media tg.MessageMediaClass) *bridgev2.MatrixMessageResponse {
 	timestamp := time.Now()
 	if tgDate > 0 {
 		timestamp = time.Unix(int64(tgDate), 0)
 	}
-	portalMeta, _ := msg.Portal.Metadata.(*PortalMetadata)
-	protectionKnown := portalMeta != nil && portalMeta.ProtectedContent != nil
+	protection := getPortalProtection(msg.Portal)
 	return &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        ids.MakeMessageID(msg.Portal.PortalKey, tgMessageID),
 			SenderID:  tc.userID,
 			Timestamp: timestamp,
 			Metadata: &MessageMetadata{
-				ContentHash:     hasher.Sum(nil),
+				ContentHash:     roundContentHash(ctx, text, media),
 				IsRound:         true,
-				ProtectionKnown: protectionKnown,
-				NoForwards:      protectionKnown && *portalMeta.ProtectedContent,
+				ProtectionKnown: protection != nil,
+				NoForwards:      protection != nil && *protection,
 			},
 		},
 		StreamOrder: int64(tgMessageID),
@@ -226,7 +234,7 @@ func (tc *TelegramClient) reconcileDuplicateRoundSend(ctx context.Context, msg *
 	timings.Reconcile += time.Since(phase)
 	if found != nil {
 		log.Info().Str("reconcile_result", "found").Msg("Telegram reported RANDOM_ID_DUPLICATE, mapped the earlier accepted round message")
-		return tc.roundMatrixResponse(ctx, msg, found.ID, found.Date, found.Media), nil
+		return tc.roundMatrixResponse(ctx, msg, found.ID, found.Date, found.Message, found.Media), nil
 	}
 	log.Warn().Str("reason_code", reason).Msg("Telegram reported RANDOM_ID_DUPLICATE but the earlier round message was not identified")
 	return nil, &RoundOperationError{Code: "round_already_sent_unmapped", Certainty: "certain", Retriable: false, Cause: sendErr}

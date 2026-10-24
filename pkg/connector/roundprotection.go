@@ -2,48 +2,46 @@ package connector
 
 import (
 	"context"
-	"time"
 
 	"go.mau.fi/mautrix-telegram/pkg/connector/ids"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/tg"
 	"go.mau.fi/util/ptr"
-	"maunium.net/go/mautrix/bridgev2"
 )
 
-// refreshRoundSourceProtection intentionally does not use a cached false to
-// authorize exporting media. Policy can change while a room is idle.
-func (tc *TelegramClient) refreshRoundSourceProtection(ctx context.Context, portal *bridgev2.Portal) error {
-	meta := portal.Metadata.(*PortalMetadata)
-	meta.ProtectedContent = nil
-	peerType, peerID, _, err := ids.ParsePortalID(portal.ID)
-	if err != nil {
-		return err
-	}
+// fetchSourceProtection asks Telegram for the current chat/channel
+// noforwards flag. Callers go through protectionFor, which bounds it to one
+// in-flight RPC per peer, reuses values younger than protectionFreshFor and
+// backs off after FLOOD_WAIT. It never waits for a flood wait itself.
+func (tc *TelegramClient) fetchSourceProtection(ctx context.Context, peerType ids.PeerType, peerID int64) (*bool, error) {
 	if peerType == ids.PeerTypeUser {
-		meta.ProtectedContent = ptr.Ptr(false)
-		return nil
+		return ptr.Ptr(false), nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
 	if tc.client == nil {
-		return nil
+		return nil, errProtectionMissing
 	}
 	var response tg.MessagesChatsClass
+	var err error
 	switch peerType {
 	case ids.PeerTypeChat:
 		response, err = tc.client.API().MessagesGetChats(ctx, []int64{peerID})
 	case ids.PeerTypeChannel:
+		if tc.ScopedStore == nil {
+			return nil, errProtectionMissing
+		}
 		var accessHash int64
 		accessHash, err = tc.ScopedStore.GetAccessHash(ctx, ids.PeerTypeChannel, peerID)
 		if err == nil {
 			response, err = tc.client.API().ChannelsGetChannels(ctx, []tg.InputChannelClass{&tg.InputChannel{ChannelID: peerID, AccessHash: accessHash}})
 		}
+	default:
+		return nil, errProtectionMissing
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if response != nil {
-		meta.ProtectedContent = mediaProtectionFromChats(peerType, peerID, response.GetChats())
+	if response == nil {
+		return nil, nil
 	}
-	return nil
+	tc.rememberProtectionFromChats(response.GetChats())
+	return mediaProtectionFromChats(peerType, peerID, response.GetChats()), nil
 }

@@ -150,26 +150,29 @@ func (tc *TelegramClient) controlSourceMessage(ctx context.Context, authorized *
 	return peer, msg, err
 }
 
-func (tc *TelegramClient) playMediaControl(ctx context.Context, req *MediaControlRequest, authorized *authorizedMediaControl) error {
+// playMediaControl marks the round played in Telegram and persists the new
+// state. It does not publish: the caller sends one media_state with the
+// result (wave 5 F13).
+func (tc *TelegramClient) playMediaControl(ctx context.Context, req *MediaControlRequest, authorized *authorizedMediaControl) (*store.RoundMediaState, error) {
 	peer, msg, err := tc.controlSourceMessage(ctx, authorized)
 	if err != nil {
-		return classifyRoundOperationError(err, false)
+		return nil, classifyRoundOperationError(err, false)
 	}
 	if msg.Noforwards {
-		return mediaControlRejected("protected_source")
+		return nil, mediaControlRejected("protected_source")
 	}
 	if err = tc.checkCurrentForwardProtection(ctx, authorized); err != nil {
-		return classifyRoundOperationError(err, false)
+		return nil, classifyRoundOperationError(err, false)
 	}
 	if err = readExactRoundContents(ctx, tc.client.API(), peer, msg, req, time.Now()); err != nil {
-		return err
+		return nil, err
 	}
 	unread := false
 	authorized.Message.Metadata.(*MessageMetadata).MediaUnread = &unread
 	if err = tc.main.Bridge.DB.Message.Update(ctx, authorized.Message); err != nil {
-		return err
+		return nil, err
 	}
-	return tc.PublishRoundMediaState(ctx, authorized.Source, authorized.Message, &unread, false, req.RequestID)
+	return tc.persistRoundMediaState(ctx, authorized.Source, authorized.Message, &unread, false)
 }
 
 type RoundMediaStateContent struct {
@@ -208,21 +211,27 @@ func (tc *TelegramConnector) mediaBridgeStateKey() string {
 // custom event from the exact same bridge bot as its capabilities/bridge-info.
 // Official Telegram-device updates use requestID=""; they are not chat reads.
 func (tc *TelegramClient) PublishRoundMediaState(ctx context.Context, portal *bridgev2.Portal, msg *database.Message, unread *bool, expired bool, requestID string) error {
+	state, err := tc.persistRoundMediaState(ctx, portal, msg, unread, expired)
+	if err != nil {
+		return err
+	}
+	return tc.sendRoundMediaState(ctx, portal, state, requestID)
+}
+
+// persistRoundMediaState stores the state and allocates its revision without
+// publishing it.
+func (tc *TelegramClient) persistRoundMediaState(ctx context.Context, portal *bridgev2.Portal, msg *database.Message, unread *bool, expired bool) (*store.RoundMediaState, error) {
 	if msg == nil || msg.Room != portal.PortalKey || msg.MXID == "" {
-		return mediaControlRejected("source_mapping_mismatch")
+		return nil, mediaControlRejected("source_mapping_mismatch")
 	}
 	state := &store.RoundMediaState{BridgeID: string(tc.main.Bridge.ID), LoginID: string(tc.loginID), PortalID: string(portal.ID), PortalReceiver: string(portal.Receiver), EventID: string(msg.MXID), MediaUnread: unread, Expired: expired}
 	if unread != nil && !*unread {
 		state.PlayedAtMS = time.Now().UnixMilli()
 		if err := store.NewRoundLedger(tc.main.Store.Database).RememberContentsRead(ctx, string(tc.main.Bridge.ID), string(tc.loginID), string(msg.ID)); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	state, err := store.NewRoundLedger(tc.main.Store.Database).PutMediaState(ctx, state)
-	if err != nil {
-		return err
-	}
-	return tc.sendRoundMediaState(ctx, portal, state, requestID)
+	return store.NewRoundLedger(tc.main.Store.Database).PutMediaState(ctx, state)
 }
 
 func (tc *TelegramClient) sendRoundMediaState(ctx context.Context, portal *bridgev2.Portal, state *store.RoundMediaState, requestID string) error {
@@ -250,20 +259,33 @@ func (tc *TelegramClient) sendRoundMediaStateWithResult(ctx context.Context, por
 }
 
 func (tc *TelegramClient) publishRoundControlResult(ctx context.Context, req *MediaControlRequest, authorized *authorizedMediaControl, failure *RoundOperationError) error {
-	ledger := store.NewRoundLedger(tc.main.Store.Database)
-	state, err := ledger.GetMediaState(ctx, string(tc.main.Bridge.ID), string(tc.loginID), string(authorized.Source.ID), string(authorized.Source.Receiver), string(authorized.Message.MXID))
-	if err != nil {
-		return err
-	}
+	return tc.publishRoundControlResultWithState(ctx, req, authorized, failure, nil)
+}
+
+// publishRoundControlResultWithState publishes a control result. A state that
+// was just persisted (played) is sent as is; otherwise the current state is
+// re-persisted to allocate the next revision.
+func (tc *TelegramClient) publishRoundControlResultWithState(ctx context.Context, req *MediaControlRequest, authorized *authorizedMediaControl, failure *RoundOperationError, state *store.RoundMediaState) error {
 	if state == nil {
-		meta := authorized.Message.Metadata.(*MessageMetadata)
-		state = &store.RoundMediaState{BridgeID: string(tc.main.Bridge.ID), LoginID: string(tc.loginID), PortalID: string(authorized.Source.ID), PortalReceiver: string(authorized.Source.Receiver), EventID: string(authorized.Message.MXID), MediaUnread: meta.MediaUnread, Expired: meta.MediaExpired}
-	}
-	// An operation acknowledgement retains content state. Forward success and
-	// failures never manufacture a played value or start a TTL timer.
-	state, err = ledger.PutMediaState(ctx, state)
-	if err != nil {
-		return err
+		ledger := store.NewRoundLedger(tc.main.Store.Database)
+		var err error
+		state, err = ledger.GetMediaState(ctx, string(tc.main.Bridge.ID), string(tc.loginID), string(authorized.Source.ID), string(authorized.Source.Receiver), string(authorized.Message.MXID))
+		if err != nil {
+			return err
+		}
+		if state == nil {
+			meta, _ := authorized.Message.Metadata.(*MessageMetadata)
+			state = &store.RoundMediaState{BridgeID: string(tc.main.Bridge.ID), LoginID: string(tc.loginID), PortalID: string(authorized.Source.ID), PortalReceiver: string(authorized.Source.Receiver), EventID: string(authorized.Message.MXID)}
+			if meta != nil {
+				state.MediaUnread, state.Expired = meta.MediaUnread, meta.MediaExpired
+			}
+		}
+		// An operation acknowledgement retains content state. Forward success
+		// and failures never manufacture a played value or start a TTL timer.
+		state, err = ledger.PutMediaState(ctx, state)
+		if err != nil {
+			return err
+		}
 	}
 	result := &RoundControlResult{RequestID: req.RequestID, Operation: "played", Status: "accepted", Certainty: "certain"}
 	if req.Destination != nil {

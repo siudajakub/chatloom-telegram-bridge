@@ -112,7 +112,7 @@ func (tc *TelegramClient) checkRoundPermission(ctx context.Context, portal *brid
 	}
 	switch peerType {
 	case ids.PeerTypeUser:
-		portal.Metadata.(*PortalMetadata).ProtectedContent = ptr.Ptr(false)
+		setPortalProtection(portal, ptr.Ptr(false))
 		input, err := tc.getInputUser(ctx, peerID)
 		if err != nil {
 			return p, err
@@ -132,7 +132,8 @@ func (tc *TelegramClient) checkRoundPermission(ctx context.Context, portal *brid
 		if err != nil {
 			return p, err
 		}
-		portal.Metadata.(*PortalMetadata).ProtectedContent = mediaProtectionFromChats(peerType, peerID, chats.GetChats())
+		tc.rememberProtectionFromChats(chats.GetChats())
+		setPortalProtection(portal, mediaProtectionFromChats(peerType, peerID, chats.GetChats()))
 		for _, raw := range chats.GetChats() {
 			if raw.GetID() == peerID {
 				p = roundPermissionFromChat(raw, time.Now())
@@ -148,7 +149,8 @@ func (tc *TelegramClient) checkRoundPermission(ctx context.Context, portal *brid
 		if err != nil {
 			return p, err
 		}
-		portal.Metadata.(*PortalMetadata).ProtectedContent = mediaProtectionFromChats(peerType, peerID, chats.GetChats())
+		tc.rememberProtectionFromChats(chats.GetChats())
+		setPortalProtection(portal, mediaProtectionFromChats(peerType, peerID, chats.GetChats()))
 		for _, raw := range chats.GetChats() {
 			if raw.GetID() == peerID {
 				p = roundPermissionFromChat(raw, time.Now())

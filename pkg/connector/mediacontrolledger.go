@@ -7,8 +7,10 @@ package connector
 import (
 	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"time"
+
+	"github.com/rs/zerolog"
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -159,11 +161,39 @@ func (tc *TelegramClient) FinishRoundSend(ctx context.Context, op *store.RoundOp
 		return &RoundOperationError{Code: "round_send_response_invalid", Certainty: "uncertain", Retriable: true}
 	}
 	cached, err := json.Marshal(cachedRoundSendResponse{Message: response.DB, Metadata: meta, StreamOrder: response.StreamOrder, TelegramMessageID: response.StreamOrder})
-	if err != nil {
-		return &RoundOperationError{Code: "round_result_persistence_failed", Certainty: "uncertain", Retriable: true, Cause: err}
+	if err == nil {
+		err = finishRoundLedgerWithRetry(finishCtx, func(ctx context.Context) error {
+			return store.NewRoundLedger(tc.main.Store.Database).Finish(ctx, op, "accepted", string(cached), "")
+		})
 	}
-	if err = store.NewRoundLedger(tc.main.Store.Database).Finish(finishCtx, op, "accepted", string(cached), ""); err != nil {
-		return &RoundOperationError{Code: "round_result_persistence_failed", Certainty: "uncertain", Retriable: true, Cause: fmt.Errorf("cache result: %w", err)}
+	if err != nil {
+		// Telegram certainly accepted the round. Reporting a failure would
+		// invite "Send again" and a duplicate in Telegram (wave 5 F14); the
+		// message row is saved by bridgev2 from the returned response. Only
+		// the replay cache of this event is missing.
+		zerolog.Ctx(ctx).Error().Str("error_code", "round_result_persistence_failed").Msg("Round was sent but its ledger result could not be stored")
 	}
 	return nil
 }
+
+// finishRoundLedgerWithRetry retries a ledger write 3 times, 200 ms apart, for
+// transient database errors such as SQLITE_BUSY.
+func finishRoundLedgerWithRetry(ctx context.Context, write func(context.Context) error) error {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return err
+			case <-time.After(roundLedgerRetryDelay):
+			}
+		}
+		if err = write(ctx); err == nil || errors.Is(err, store.ErrRoundDispatchBusy) {
+			// A lost claim is not transient: another attempt owns the row.
+			return err
+		}
+	}
+	return err
+}
+
+var roundLedgerRetryDelay = 200 * time.Millisecond

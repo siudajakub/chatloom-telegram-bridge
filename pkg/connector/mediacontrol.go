@@ -82,8 +82,7 @@ func classifyRoundOperationError(err error, dispatched bool) *RoundOperationErro
 	}
 	var media *RoundMediaError
 	if errors.As(err, &media) {
-		retriable := media.Code == "upload_limit_unknown" || media.Code == "encode_timeout" || media.Code == "transfer_timeout" || media.Code == "temporary_storage" || media.Code == "media_download_failed"
-		return &RoundOperationError{Code: media.Code, Certainty: "certain", Retriable: retriable, Cause: err}
+		return &RoundOperationError{Code: media.Code, Certainty: "certain", Retriable: media.Retriable(), Cause: err}
 	}
 	if errors.Is(err, store.ErrRoundIdentityChanged) {
 		return &RoundOperationError{Code: "identity_changed", Certainty: "certain", Cause: err}
@@ -227,24 +226,41 @@ func (tc *TelegramConnector) authorizeMediaControl(ctx context.Context, evt *eve
 	if msg == nil || msg.Room != source.PortalKey || msg.MXID != req.Source.EventID {
 		return nil, mediaControlRejected("source_mapping_mismatch")
 	}
+	// From here the sender, its own login and the source mapping are known:
+	// rejections are returned with this partial result so the client gets a
+	// control_result instead of silence (wave 5 F13). Destination stays the
+	// source until it is verified.
+	known := &authorizedMediaControl{Client: client, Source: source, Destination: source, Message: msg}
 	meta, ok := msg.Metadata.(*MessageMetadata)
 	if !ok || !meta.IsRound || meta.TTLSeconds != 0 || meta.MediaExpired || meta.NoForwards || !meta.ProtectionKnown || (meta.MediaPolicy != nil && !meta.MediaPolicy.TransferAllowed) {
-		return nil, mediaControlRejected("source_media_unavailable")
+		return known, mediaControlRejected("source_media_unavailable")
 	}
 	result := &authorizedMediaControl{Client: client, Source: source, Destination: source, Message: msg}
 	if req.Destination != nil {
 		result.Destination, err = tc.Bridge.GetPortalByMXID(ctx, req.Destination.RoomID)
 		if err != nil {
-			return nil, err
+			return known, err
 		}
 		if err = tc.authorizeControlPortal(ctx, evt.Sender, login, result.Destination, event.EventMessage); err != nil {
-			return nil, err
+			return known, err
 		}
 		if meta.NoForwards || !meta.ProtectionKnown {
-			return nil, mediaControlRejected("protected_or_unknown_source")
+			return known, mediaControlRejected("protected_or_unknown_source")
 		}
 	}
 	return result, nil
+}
+
+// publishRejectedControl reports a rejection that happened before the ledger
+// was reached, when the source mapping is known.
+func publishRejectedControl(ctx context.Context, req *MediaControlRequest, known *authorizedMediaControl, err error) {
+	if req == nil || known == nil || known.Client == nil || known.Source == nil || known.Message == nil {
+		return
+	}
+	typed := classifyRoundOperationError(err, false)
+	if publishErr := known.Client.publishRoundControlResult(ctx, req, known, typed); publishErr != nil {
+		zerolog.Ctx(ctx).Debug().Str("media_control_error", typed.Code).Msg("Could not publish Telegram media control rejection")
+	}
 }
 
 func (tc *TelegramConnector) authorizeControlPortal(ctx context.Context, sender id.UserID, login *bridgev2.UserLogin, portal *bridgev2.Portal, typ event.Type) error {
@@ -291,19 +307,24 @@ func (tc *TelegramConnector) handleMediaControlEvent(ctx context.Context, evt *e
 	}
 	if err != nil {
 		zerolog.Ctx(ctx).Warn().Str("media_control_error", classifyRoundOperationError(err, false).Code).Msg("Rejected Telegram media control")
+		publishRejectedControl(ctx, req, authorized, err)
 		return
 	}
 	queued := &queuedMediaControl{Key: authorized.Destination.PortalKey, Login: authorized.Client.userLogin, Run: func(queueCtx context.Context, portal *bridgev2.Portal) {
 		// Revalidate after queueing: stale Incognito grants and changed membership
 		// never flush later merely because a portal was busy/offline.
 		if err := validateMediaControlAge(req, time.Now()); err != nil {
+			publishRejectedControl(queueCtx, req, authorized, err)
 			return
 		}
 		fresh, err := tc.authorizeMediaControl(queueCtx, evt, req)
 		if err == nil && fresh.Destination.PortalKey != portal.PortalKey {
 			err = mediaControlRejected("destination_mapping_changed")
 		}
-		if err == nil {
+		if err != nil {
+			publishRejectedControl(queueCtx, req, fresh, err)
+		} else {
+			// executeMediaControl publishes its own results.
 			err = fresh.Client.executeMediaControl(queueCtx, evt, req, fresh)
 		}
 		if err != nil {
@@ -378,10 +399,16 @@ func (tc *TelegramClient) executeMediaControl(ctx context.Context, evt *event.Ev
 	}
 	rpcCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	var playedState *store.RoundMediaState
 	if evt.Type == MediaPlayedEventType {
-		err = tc.playMediaControl(rpcCtx, req, authorized)
+		playedState, err = tc.playMediaControl(rpcCtx, req, authorized)
 	} else {
 		err = tc.forwardMediaControl(rpcCtx, req, authorized, op.RandomID)
+		if tgerr.Is(err, "RANDOM_ID_DUPLICATE") {
+			// A retried uncertain forward: Telegram already has the forward
+			// with this stable random ID, so it is accepted (wave 5 F13).
+			err = nil
+		}
 	}
 	finishCtx, finishCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer finishCancel()
@@ -402,5 +429,7 @@ func (tc *TelegramClient) executeMediaControl(ctx context.Context, evt *event.Ev
 	if err = ledger.Finish(finishCtx, op, "accepted", "", ""); err != nil {
 		return classifyRoundOperationError(err, true)
 	}
-	return tc.publishRoundControlResult(finishCtx, req, authorized, nil)
+	// Played publishes one media_state carrying both the new state and the
+	// result (it used to send two events and bump the revision twice).
+	return tc.publishRoundControlResultWithState(finishCtx, req, authorized, nil, playedState)
 }

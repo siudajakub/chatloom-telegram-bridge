@@ -18,7 +18,10 @@ package connector
 
 import (
 	"context"
+	"sync"
+	"time"
 
+	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/commands"
@@ -34,6 +37,14 @@ type TelegramConnector struct {
 	useDirectMedia       bool
 	maxFileSize          int64
 	mediaControlsEnabled bool
+
+	// Wave 5 (ChatLoom fork) runtime switches, read from the environment
+	// because bbctl regenerates config.yaml.
+	protectionStaleOnError bool
+	roundTempDir           string
+
+	// Wave 5b: the @gif search provisioning routes are added once.
+	gifRoutesOnce sync.Once
 }
 
 var _ bridgev2.NetworkConnector = (*TelegramConnector)(nil)
@@ -42,12 +53,35 @@ var _ bridgev2.MaxFileSizeingNetwork = (*TelegramConnector)(nil)
 func (tc *TelegramConnector) Init(bridge *bridgev2.Bridge) {
 	tc.Store = store.NewStore(bridge.DB.Database, dbutil.ZeroLogger(bridge.Log.With().Str("db_section", "telegram").Logger()))
 	tc.Bridge = bridge
+	tc.protectionStaleOnError = envFlag(protectionStaleOnErrorEnv, true)
+	tc.roundTempDir = roundTempDirFromEnv()
 	tc.RegisterMediaControlHandlers()
 	tc.Bridge.Commands.(*commands.Processor).AddHandlers(cmdSyncChats, cmdEmojiPack, cmdUpgrade, cmdJoin)
 }
 
 func (tc *TelegramConnector) Start(ctx context.Context) error {
-	return tc.Store.Upgrade(ctx)
+	if err := tc.Store.Upgrade(ctx); err != nil {
+		return err
+	}
+	tc.startupMaintenance(ctx)
+	tc.registerGIFRoutes(ctx)
+	return nil
+}
+
+// startupMaintenance does the fork's one-off clean-up at start (wave 5 F10,
+// F11): crash leftovers of round preparation and old ledger rows. Failures
+// are logged and never block the start.
+func (tc *TelegramConnector) startupMaintenance(ctx context.Context) {
+	log := zerolog.Ctx(ctx)
+	if removed := sweepRoundTempFiles(tc.roundTempDir, time.Hour, time.Now()); removed > 0 {
+		log.Info().Int("removed", removed).Msg("Removed stale round video temporary files")
+	}
+	contents, operations, err := store.NewRoundLedger(tc.Store.Database).PruneFinished(ctx, time.Now().Add(-store.RoundLedgerRetention))
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to prune old round ledger rows")
+	} else if contents > 0 || operations > 0 {
+		log.Info().Int64("contents_read_rows", contents).Int64("operation_rows", operations).Msg("Pruned old round ledger rows")
+	}
 }
 
 func (tc *TelegramConnector) PreSplitPortalMigrate(ctx context.Context) error {

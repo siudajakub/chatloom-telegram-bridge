@@ -204,9 +204,11 @@ func TestMediaControlAuthorizedEncryptedQueueRPCAndDurableDedup(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, state.MediaUnread)
 	require.False(t, *state.MediaUnread)
-	require.GreaterOrEqual(t, state.Revision, int64(3))
+	// Wave 5 F13: played publishes one media_state carrying the new state
+	// and the result, the replay one more: two events, two revisions.
+	require.EqualValues(t, 2, state.Revision)
 	require.Zero(t, ordinarySends.Load())
-	require.GreaterOrEqual(t, encryptedSends.Load(), int64(3))
+	require.EqualValues(t, 2, encryptedSends.Load())
 	cryptoFixture.mu.Lock()
 	last := cryptoFixture.states[len(cryptoFixture.states)-1]
 	cryptoFixture.mu.Unlock()
@@ -257,6 +259,26 @@ func TestMediaControlAuthorizedEncryptedQueueRPCAndDurableDedup(t *testing.T) {
 		require.EqualValues(t, 1, rpc.contentsCalls.Load())
 		require.Equal(t, before, encryptedSends.Load()) // no source-state oracle
 	}
+	// Wave 5 F13: once the sender's own login and the source mapping are
+	// verified, a rejection is published as a control_result instead of only
+	// being logged. No Telegram RPC is made.
+	ttl := &database.Message{ID: "43", MXID: "$synthetic-ttl", Room: portal.PortalKey, SenderID: "777", Timestamp: time.Now(), Metadata: &MessageMetadata{IsRound: true, ProtectionKnown: true, TTLSeconds: 30}}
+	require.NoError(t, br.DB.Message.Insert(ctx, ttl))
+	unavailable := syntheticControlEvent(time.Now())
+	unavailable.ID = "$synthetic-unavailable"
+	unavailable.Content.Raw["request_id"] = "synthetic-unavailable"
+	unavailable.Content.Raw["source"].(map[string]any)["account_id"] = "123"
+	unavailable.Content.Raw["source"].(map[string]any)["event_id"] = "$synthetic-ttl"
+	before := encryptedSends.Load()
+	dispatch(unavailable)
+	require.Equal(t, before+1, encryptedSends.Load())
+	require.EqualValues(t, 1, rpc.getCalls.Load())
+	cryptoFixture.mu.Lock()
+	unavailableResult := cryptoFixture.states[len(cryptoFixture.states)-1]
+	cryptoFixture.mu.Unlock()
+	require.Equal(t, id.EventID("$synthetic-ttl"), unavailableResult.SourceEventID)
+	require.Equal(t, "rejected", unavailableResult.ControlResult.Status)
+	require.Equal(t, "source_media_unavailable", unavailableResult.ControlResult.ErrorCode)
 	// Protection can change after Matrix ingestion. The authoritative source
 	// re-fetch blocks contents-read even when stored metadata previously allowed.
 	rpc.remote.Noforwards = true

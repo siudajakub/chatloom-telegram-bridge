@@ -222,9 +222,11 @@ func (tc *TelegramClient) FetchMessages(ctx context.Context, fetchParams bridgev
 			}
 			return nil, err
 		}
-		// Use the current history response rather than a stale cached false.
-		// Missing/min-only group policy remains unknown and blocks media.
-		fetchParams.Portal.Metadata.(*PortalMetadata).ProtectedContent = mediaProtectionFromChats(peerType, peerID, resp.GetChats())
+		// The history response carries current chat entities: conversions of
+		// this batch reuse them instead of one protection RPC per message.
+		// Missing/min-only policy is looked up once per peer (wave 5 F1).
+		tc.rememberProtectionFromChats(resp.GetChats())
+		setPortalProtection(fetchParams.Portal, mediaProtectionFromChats(peerType, peerID, resp.GetChats()))
 		newMessages := resp.GetMessages()
 		if messages == nil {
 			messages = newMessages

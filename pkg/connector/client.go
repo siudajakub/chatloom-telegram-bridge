@@ -92,6 +92,16 @@ type TelegramClient struct {
 	appConfig              map[string]any
 	appConfigHash          int
 	appConfigFetched       time.Time
+	// Wave 5 (ChatLoom fork): app config refresh outside appConfigLock,
+	// content protection cache, change-only media capability state and
+	// capability refresh off the portal loop.
+	appConfigFetchLock    sync.Mutex
+	appConfigRetryAt      time.Time
+	fetchAppConfig        func(ctx context.Context, hash int) (tg.HelpAppConfigClass, error)
+	protection            protectionCache
+	lastMediaCaps         sync.Map // networkid.PortalKey -> [32]byte
+	capabilityRefreshFunc func(*bridgev2.Portal)
+	roundRefreshBlockedAt atomic.Int64
 
 	availableReactionsLock    sync.Mutex
 	availableReactions        exmaps.Set[string]
@@ -126,6 +136,10 @@ type TelegramClient struct {
 	stickerPacksByName   map[string]*stickerPackCache
 	stickerPacksByID     map[int64]*stickerPackCache
 	stickerPackCacheLock sync.Mutex
+
+	// Wave 5b (ChatLoom fork): @gif search state (gifsearch.go).
+	gifs     *gifSearchState
+	gifsOnce sync.Once
 }
 
 var _ bridgev2.NetworkAPI = (*TelegramClient)(nil)

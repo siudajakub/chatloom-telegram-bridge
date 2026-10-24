@@ -87,7 +87,7 @@ func (tc *TelegramClient) mediaToMatrix(
 	intent bridgev2.MatrixAPI,
 	msg *tg.Message,
 ) (*bridgev2.ConvertedMessagePart, *database.DisappearingSetting, []byte) {
-	if policy := mediaPolicyForMessage(portal, msg); !policy.TransferAllowed {
+	if policy := mediaPolicyForMessage(ctx, portal, msg); !policy.TransferAllowed {
 		return blockedMediaPart(policy), nil, nil
 	}
 	media, ok := msg.GetMedia()
@@ -158,21 +158,32 @@ func (tc *TelegramClient) convertToMatrix(
 	ctx = log.WithContext(ctx)
 
 	// TTL and message-level protection already prohibit any ordinary export.
-	// Otherwise refresh current chat protection centrally for live messages,
-	// edits and history before a cached false can authorize a media transfer.
+	// Otherwise decide current chat protection once for this live message,
+	// edit or history item: a fresh known value (update entities, chat info,
+	// history responses) or one bounded RPC per peer. Every nested media
+	// guard uses this same decision.
 	if messageNeedsMediaTransfer(msg) && !msg.Noforwards && tc.client != nil {
 		ttlPresent := false
 		if ttlMedia, ok := msg.Media.(ttlable); ok {
 			_, ttlPresent = ttlMedia.GetTTLSeconds()
 		}
 		if !ttlPresent {
-			if err := tc.refreshRoundSourceProtection(ctx, portal); err != nil {
-				log.Warn().Msg("Unable to verify Telegram content protection; blocking media")
+			protection, err := tc.protectionFor(ctx, portal)
+			if err != nil && protection == nil {
+				log.Warn().Str("reason_code", protectionLookupReason(err)).Msg("Unable to verify Telegram content protection; blocking media only")
 			}
+			ctx = withProtectionDecision(ctx, protection)
 		}
 	}
-	policy := mediaPolicyForMessage(portal, msg)
-	if !policy.TransferAllowed {
+	policy := mediaPolicyForMessage(ctx, portal, msg)
+	// Unknown or protected (noforwards) content blocks only the media: the
+	// text, reply and fallback emoji are bridged like Telegram clients show
+	// them, and media, link preview and custom emoji documents are not. The
+	// text part says protected_content so clients keep forward, copy and
+	// transcription off (F15 approved by J 2026-10-22). TTL and view-once
+	// media keep the full block.
+	keepText := !policy.TransferAllowed && (policy.Reason == "unknown_protection" || policy.Reason == "protected_content") && msg.RichMessage.Zero() && tc.client != nil
+	if !policy.TransferAllowed && !keepText {
 		return blockedMediaMessage(portal, msg, policy), nil
 	}
 
@@ -216,8 +227,12 @@ func (tc *TelegramClient) convertToMatrix(
 	} else if len(msg.Message) > 0 || (msg.Media != nil && msg.Media.TypeID() == tg.MessageMediaWebPageTypeID) {
 		hasher.Write([]byte(msg.Message))
 
-		content := tc.parseBodyAndHTML(ctx, msg.Message, msg.Entities)
-		if media, ok := msg.GetMedia(); ok && media.TypeID() == tg.MessageMediaWebPageTypeID {
+		entities := msg.Entities
+		if !policy.TransferAllowed {
+			entities = stripCustomEmojiEntities(entities)
+		}
+		content := tc.parseBodyAndHTML(ctx, msg.Message, entities)
+		if media, ok := msg.GetMedia(); ok && media.TypeID() == tg.MessageMediaWebPageTypeID && policy.TransferAllowed {
 			webpageCtx, webpageCtxCancel := context.WithTimeout(ctx, time.Second*5)
 			defer webpageCtxCancel()
 			preview, err := tc.webpageToBeeperLinkPreview(webpageCtx, portal, intent, msg, media)
@@ -236,7 +251,15 @@ func (tc *TelegramClient) convertToMatrix(
 	}
 
 	var contentURI id.ContentURIString
-	mediaPart, disappearingSetting, mediaHashID := tc.mediaToMatrix(ctx, portal, intent, msg)
+	var mediaPart *bridgev2.ConvertedMessagePart
+	var disappearingSetting *database.DisappearingSetting
+	var mediaHashID []byte
+	if keepText && (msg.Media == nil || msg.Media.TypeID() == tg.MessageMediaWebPageTypeID) {
+		// Plain text, or only a link preview or custom emoji needed
+		// protection: drop them without adding a notice.
+	} else {
+		mediaPart, disappearingSetting, mediaHashID = tc.mediaToMatrix(ctx, portal, intent, msg)
+	}
 	if mediaPart != nil {
 		hasher.Write(mediaHashID)
 		cm.Parts = append(cm.Parts, mediaPart)
@@ -245,7 +268,11 @@ func (tc *TelegramClient) convertToMatrix(
 			mediaPart.Type = event.EventMessage
 			mediaPart.Content.MsgType = event.MsgImage
 		}
-		cm.MergeCaption()
+		// A blocked media notice stays a separate part, so the text remains
+		// an ordinary message instead of being folded into the notice.
+		if _, blocked := mediaPart.Extra[mediaPolicyKey]; !blocked {
+			cm.MergeCaption()
+		}
 
 		contentURI = mediaPart.Content.URL
 		if contentURI == "" && mediaPart.Content.File != nil {
@@ -320,7 +347,14 @@ func (tc *TelegramClient) convertToMatrix(
 	if cm.Parts[0].Extra == nil {
 		cm.Parts[0].Extra = make(map[string]any)
 	}
-	cm.Parts[0].Extra[mediaPolicyKey] = policy
+	partPolicy := policy
+	if keepText && cm.Parts[0] != mediaPart {
+		// The text itself was bridged. Clients must still not forward,
+		// copy or transcribe it while protection is unknown (null) or set
+		// (true); transfer_allowed=false is only for the media notice part.
+		partPolicy = keptTextPolicy(policy)
+	}
+	cm.Parts[0].Extra[mediaPolicyKey] = partPolicy
 	if externalURL := getMessageLink(msg); externalURL != "" {
 		cm.Parts[0].Extra["external_url"] = externalURL
 	}
@@ -499,7 +533,7 @@ func (tc *TelegramClient) parseRichText(ctx context.Context, message *tg.RichMes
 }
 
 func (tc *TelegramClient) webpageToBeeperLinkPreview(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msg *tg.Message, msgMedia tg.MessageMediaClass) (preview *event.BeeperLinkPreview, err error) {
-	if policy := mediaPolicyForMessage(portal, msg); !policy.TransferAllowed {
+	if policy := mediaPolicyForMessage(ctx, portal, msg); !policy.TransferAllowed {
 		return nil, errRestrictedMedia
 	}
 	webpage, ok := msgMedia.(*tg.MessageMediaWebPage).Webpage.(*tg.WebPage)
@@ -567,7 +601,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 	allowRefetch bool,
 ) (converted *bridgev2.ConvertedMessagePart, disappearingSetting *database.DisappearingSetting) {
 	// Check before creating transferers, touching the cache, or exposing thumbnails.
-	if policy := mediaPolicyForMessage(portal, &tg.Message{Media: msgMedia}); !policy.TransferAllowed {
+	if policy := mediaPolicyForMessage(ctx, portal, &tg.Message{Media: msgMedia}); !policy.TransferAllowed {
 		return blockedMediaPart(policy), nil
 	}
 	msgID := msg.ID

@@ -6,8 +6,10 @@ package connector
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.mau.fi/util/ptr"
@@ -48,16 +50,20 @@ func TestRestrictedMediaNoTransferOrTimers(t *testing.T) {
 		noForwards bool
 		protection *bool
 		reason     string
+		// keepText: since wave 5 (F1/F15) protected and unknown-protection
+		// messages bridge their text when the client is logged in; the
+		// media part stays a notice without any transfer.
+		keepText bool
 	}{
-		{"ttl_round", intakeDocument(true, ptr.Ptr(30)), false, ptr.Ptr(false), "ttl"},
-		{"ttl_ordinary", intakeDocument(false, ptr.Ptr(1)), false, ptr.Ptr(false), "ttl"},
-		{"view_once_round", intakeDocument(true, ptr.Ptr(2147483647)), false, ptr.Ptr(false), "view_once"},
-		{"unknown_zero_ttl", intakeDocument(true, ptr.Ptr(0)), false, ptr.Ptr(false), "unknown_ttl"},
-		{"unknown_negative_ttl", intakeDocument(true, ptr.Ptr(-1)), false, ptr.Ptr(false), "unknown_ttl"},
-		{"message_protected", intakeDocument(true, nil), true, ptr.Ptr(false), "protected_content"},
-		{"chat_protected", intakeDocument(false, nil), false, ptr.Ptr(true), "protected_content"},
-		{"unknown_chat", intakeDocument(true, nil), false, nil, "unknown_protection"},
-		{"protected_web_preview", &tg.MessageMediaWebPage{Webpage: &tg.WebPage{URL: "https://example.invalid", Photo: &tg.Photo{ID: 12}}}, true, ptr.Ptr(false), "protected_content"},
+		{"ttl_round", intakeDocument(true, ptr.Ptr(30)), false, ptr.Ptr(false), "ttl", false},
+		{"ttl_ordinary", intakeDocument(false, ptr.Ptr(1)), false, ptr.Ptr(false), "ttl", false},
+		{"view_once_round", intakeDocument(true, ptr.Ptr(2147483647)), false, ptr.Ptr(false), "view_once", false},
+		{"unknown_zero_ttl", intakeDocument(true, ptr.Ptr(0)), false, ptr.Ptr(false), "unknown_ttl", false},
+		{"unknown_negative_ttl", intakeDocument(true, ptr.Ptr(-1)), false, ptr.Ptr(false), "unknown_ttl", false},
+		{"message_protected", intakeDocument(true, nil), true, ptr.Ptr(false), "protected_content", true},
+		{"chat_protected", intakeDocument(false, nil), false, ptr.Ptr(true), "protected_content", false},
+		{"unknown_chat", intakeDocument(true, nil), false, nil, "unknown_protection", false},
+		{"protected_web_preview", &tg.MessageMediaWebPage{Webpage: &tg.WebPage{URL: "https://example.invalid", Photo: &tg.Photo{ID: 12}}}, true, ptr.Ptr(false), "protected_content", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			portal := intakePortal(ids.PeerTypeChannel, test.protection)
@@ -78,6 +84,22 @@ func TestRestrictedMediaNoTransferOrTimers(t *testing.T) {
 			}
 			converted, err := client.convertToMatrix(context.Background(), portal, nil, msg)
 			require.NoError(t, err)
+			if test.keepText {
+				require.Equal(t, event.MsgText, converted.Parts[0].Content.MsgType)
+				require.Equal(t, msg.Message, converted.Parts[0].Content.Body)
+				require.Empty(t, converted.Parts[0].Content.BeeperLinkPreviews)
+				require.NotNil(t, converted.ReplyTo)
+				for _, part := range converted.Parts[1:] {
+					require.Equal(t, event.MsgNotice, part.Content.MsgType)
+					require.Nil(t, part.Content.Info)
+				}
+				data, err := json.Marshal(converted)
+				require.NoError(t, err)
+				for _, forbidden := range []string{"mxc://", "file_reference", "thumbnail_url"} {
+					require.NotContains(t, string(data), forbidden)
+				}
+				return
+			}
 			require.Len(t, converted.Parts, 1)
 			require.Zero(t, converted.Disappear.Timer)
 			require.Empty(t, converted.Disappear.Type)
@@ -122,24 +144,43 @@ func TestRestrictedConversionEntrypointsCannotBypassGuard(t *testing.T) {
 	require.Nil(t, preview)
 }
 
-func TestProtectedTextAndUnknownCustomEmojiCannotExportContent(t *testing.T) {
+// Wave 5: protected plain text is shown (F15, approved by J 2026-10-22) and
+// text with custom emoji of unknown protection keeps its fallback text (F1).
+// Neither exports a custom emoji document. A logged-out client keeps the old
+// full block.
+func TestProtectedTextAndUnknownCustomEmojiExportNoMedia(t *testing.T) {
 	for _, test := range []struct {
 		name       string
 		protection *bool
 		entities   []tg.MessageEntityClass
+		protected  *bool
 	}{
-		{"protected_plain_text", ptr.Ptr(true), nil},
-		{"unknown_custom_emoji", nil, []tg.MessageEntityClass{&tg.MessageEntityCustomEmoji{DocumentID: 12}}},
+		{"protected_plain_text", ptr.Ptr(true), nil, ptr.Ptr(true)},
+		{"unknown_custom_emoji", nil, []tg.MessageEntityClass{&tg.MessageEntityCustomEmoji{DocumentID: 12}}, nil},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			msg := &tg.Message{ID: 7, Message: "content must not leak", Entities: test.entities}
+			msg := &tg.Message{ID: 7, Message: "content is text", Entities: test.entities}
 			msg.SetTTLPeriod(30)
-			client := &TelegramClient{}
+			rpc := &protectionRPC{fail: errors.New("synthetic protection lookup failure")}
+			client := protectionClient(rpc, false)
 			converted, err := client.convertToMatrix(context.Background(), intakePortal(ids.PeerTypeChat, test.protection), nil, msg)
 			require.NoError(t, err)
-			require.Equal(t, event.MsgNotice, converted.Parts[0].Content.MsgType)
-			require.NotContains(t, converted.Parts[0].Content.Body, msg.Message)
-			require.Zero(t, converted.Disappear.Timer)
+			require.Len(t, converted.Parts, 1)
+			require.Equal(t, event.MsgText, converted.Parts[0].Content.MsgType)
+			require.Equal(t, msg.Message, converted.Parts[0].Content.Body)
+			policy := converted.Parts[0].Extra[mediaPolicyKey].(*TelegramMediaPolicy)
+			require.True(t, policy.TransferAllowed)
+			require.Equal(t, test.protected, policy.ProtectedContent)
+			require.Equal(t, 30*time.Second, converted.Disappear.Timer)
+			data, err := json.Marshal(converted)
+			require.NoError(t, err)
+			require.NotContains(t, string(data), "mxc://")
+
+			loggedOut, err := (&TelegramClient{}).convertToMatrix(context.Background(), intakePortal(ids.PeerTypeChat, test.protection), nil, msg)
+			require.NoError(t, err)
+			require.Equal(t, event.MsgNotice, loggedOut.Parts[0].Content.MsgType)
+			require.NotContains(t, loggedOut.Parts[0].Content.Body, msg.Message)
+			require.Zero(t, loggedOut.Disappear.Timer)
 		})
 	}
 }

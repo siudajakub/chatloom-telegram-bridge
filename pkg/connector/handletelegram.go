@@ -1027,6 +1027,9 @@ func (tc *TelegramClient) onUpdateWrapper(ctx context.Context, e tg.Entities, up
 
 func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.UpdateClass) error {
 	zerolog.Ctx(ctx).Trace().Type("update_type", upd).Msg("Telegram update type")
+	// Content protection of the chats in this update is as fresh as an RPC
+	// for the message it carries (wave 5 F1).
+	tc.rememberProtectionFromEntities(e)
 	for userID, user := range e.Users {
 		zerolog.Ctx(ctx).Trace().Type("user_type", user).Msg("Telegram user update type")
 		if _, err := tc.updateGhost(ctx, userID, user); err != nil {
@@ -1377,37 +1380,93 @@ func (tc *TelegramClient) inputPeerForPortalID(ctx context.Context, portalID net
 	}
 }
 
+// appConfigMaxAge is how long the app config is used without a refresh.
+const appConfigMaxAge = 5 * time.Minute
+
+// appConfigRetryDelay spaces refresh attempts after a failed refresh.
+const appConfigRetryDelay = 30 * time.Second
+
+// getAppConfigCached serves the cached app config and refreshes it at most
+// every appConfigMaxAge (stale-while-revalidate, wave 5 TF-01). The RPC never
+// runs under appConfigLock, so capability snapshots are never blocked by it.
+// A failed refresh keeps serving the previous map; only the very first fetch
+// can return an error.
 func (tc *TelegramClient) getAppConfigCached(ctx context.Context) (map[string]any, error) {
 	if tc.metadata.IsBot {
 		return nil, nil
 	}
 	tc.appConfigLock.Lock()
-	defer tc.appConfigLock.Unlock()
-	if tc.appConfig == nil || (!tc.appConfigFetched.IsZero() && time.Since(tc.appConfigFetched) > 5*time.Minute) {
-		cfg, err := tc.client.API().HelpGetAppConfig(ctx, tc.appConfigHash)
-		if err != nil {
-			return nil, err
-		}
-		if _, unchanged := cfg.(*tg.HelpAppConfigNotModified); unchanged && tc.appConfig != nil {
-			tc.appConfigFetched = time.Now()
-			return tc.appConfig, nil
-		}
-		appConfig, ok := cfg.(*tg.HelpAppConfig)
-		if !ok {
-			return nil, fmt.Errorf("failed to get app config: unexpected type %T", appConfig)
-		}
-		parsedConfig, err := tljson.Parse(appConfig.Config)
-		if err != nil {
-			return nil, err
-		}
-		tc.appConfig, ok = parsedConfig.(map[string]any)
-		if !ok {
-			return nil, fmt.Errorf("failed to parse app config: unexpected type %T", tc.appConfig)
-		}
-		tc.appConfigHash = appConfig.Hash
-		tc.appConfigFetched = time.Now()
+	cached, fetched, retryAt := tc.appConfig, tc.appConfigFetched, tc.appConfigRetryAt
+	tc.appConfigLock.Unlock()
+	now := time.Now()
+	// A config without a fetch time (set directly) never expires, as upstream.
+	if cached != nil && (fetched.IsZero() || now.Sub(fetched) <= appConfigMaxAge || now.Before(retryAt)) {
+		return cached, nil
 	}
-	return tc.appConfig, nil
+	if cached != nil {
+		// Stale: one caller refreshes, every other caller keeps the old map.
+		if !tc.appConfigFetchLock.TryLock() {
+			return cached, nil
+		}
+	} else {
+		tc.appConfigFetchLock.Lock()
+	}
+	defer tc.appConfigFetchLock.Unlock()
+	tc.appConfigLock.Lock()
+	cached, fetched, hash := tc.appConfig, tc.appConfigFetched, tc.appConfigHash
+	tc.appConfigLock.Unlock()
+	if cached != nil && (fetched.IsZero() || time.Since(fetched) <= appConfigMaxAge) {
+		return cached, nil
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	parsed, newHash, err := tc.fetchAppConfigOnce(fetchCtx, hash, cached)
+	tc.appConfigLock.Lock()
+	defer tc.appConfigLock.Unlock()
+	if err != nil {
+		if cached == nil {
+			return nil, err
+		}
+		retry := appConfigRetryDelay
+		if wait, ok := tgerr.AsFloodWait(err); ok && wait > retry {
+			retry = wait
+		}
+		tc.appConfigRetryAt = time.Now().Add(retry)
+		zerolog.Ctx(ctx).Debug().Msg("App config refresh failed, using the cached config")
+		return cached, nil
+	}
+	tc.appConfig, tc.appConfigHash, tc.appConfigFetched = parsed, newHash, time.Now()
+	tc.appConfigRetryAt = time.Time{}
+	return parsed, nil
+}
+
+func (tc *TelegramClient) fetchAppConfigOnce(ctx context.Context, hash int, cached map[string]any) (map[string]any, int, error) {
+	fetch := tc.fetchAppConfig
+	if fetch == nil {
+		fetch = func(ctx context.Context, hash int) (tg.HelpAppConfigClass, error) {
+			return tc.client.API().HelpGetAppConfig(ctx, hash)
+		}
+	}
+	cfg, err := fetch(ctx, hash)
+	if err != nil {
+		return nil, 0, err
+	}
+	if _, unchanged := cfg.(*tg.HelpAppConfigNotModified); unchanged && cached != nil {
+		return cached, hash, nil
+	}
+	appConfig, ok := cfg.(*tg.HelpAppConfig)
+	if !ok {
+		return nil, 0, fmt.Errorf("failed to get app config: unexpected type %T", cfg)
+	}
+	parsedConfig, err := tljson.Parse(appConfig.Config)
+	if err != nil {
+		return nil, 0, err
+	}
+	parsed, ok := parsedConfig.(map[string]any)
+	if !ok {
+		return nil, 0, fmt.Errorf("failed to parse app config: unexpected type %T", parsedConfig)
+	}
+	return parsed, appConfig.Hash, nil
 }
 
 func (tc *TelegramClient) getAvailableReactionsForCapability(ctx context.Context) ([]string, bool) {

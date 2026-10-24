@@ -105,8 +105,10 @@ func (tc *TelegramClient) getDMChatInfo(userID int64) (*bridgev2.ChatInfo, error
 		CanBackfill: !tc.metadata.IsBot,
 		ExtraUpdates: func(ctx context.Context, portal *bridgev2.Portal) bool {
 			updatePortalLastSyncAt(ctx, portal)
-			permission, _ := tc.checkRoundPermission(ctx, portal)
-			setRoundPermission(portal, string(tc.userLogin.ID), permission)
+			// No users.getFullUser here (wave 5 F7): chat info syncs run for
+			// every DM at start-up. The round permission stays as cached and
+			// the lazy capability refresh fills it outside the portal loop.
+			setPortalProtection(portal, ptr.Ptr(false))
 			return true
 		},
 	}
@@ -239,18 +241,10 @@ func (tc *TelegramClient) wrapChatInfo(portalID networkid.PortalID, rawChat tg.C
 	}
 	info.ExtraUpdates = func(ctx context.Context, portal *bridgev2.Portal) bool {
 		meta := portal.Metadata.(*PortalMetadata)
-		switch c := rawChat.(type) {
-		case *tg.Chat:
-			meta.ProtectedContent = ptr.Ptr(c.Noforwards)
-		case *tg.Channel:
-			if c.Min {
-				meta.ProtectedContent = nil
-			} else {
-				meta.ProtectedContent = ptr.Ptr(c.Noforwards)
-			}
-		default:
-			meta.ProtectedContent = nil
-		}
+		// Min/forbidden constructors carry no reliable flag; they never
+		// overwrite a known value (wave 5 F1/F6).
+		_, protection := protectionFromChatEntity(rawChat)
+		tc.rememberPortalProtection(portal, protection)
 		setRoundPermission(portal, string(tc.userLogin.ID), roundPermissionFromChat(rawChat, time.Now()))
 		_ = updatePortalLastSyncAt(ctx, portal)
 		changed := meta.SetIsSuperGroup(isMegagroup)

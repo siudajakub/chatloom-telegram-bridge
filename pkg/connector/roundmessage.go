@@ -30,6 +30,7 @@ import (
 	"go.mau.fi/mautrix-telegram/pkg/gotd/constant"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/uploader"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/tg"
+	"go.mau.fi/mautrix-telegram/pkg/gotd/tgerr"
 )
 
 const (
@@ -162,28 +163,52 @@ type roundProbe struct {
 	} `json:"format"`
 }
 
+// boundedRoundOutput must not embed bytes.Buffer: exec copies stdout with
+// io.Copy, which would use the promoted Buffer.ReadFrom and bypass Write, so
+// the limit was never applied before wave 5 (found by the TF-04 test).
 type boundedRoundOutput struct {
-	bytes.Buffer
+	buf   bytes.Buffer
 	limit int
+	// onLimit stops the tool as soon as its output exceeds the limit, so it
+	// does not keep running until the preparation deadline (wave 5 TF-04).
+	onLimit  func()
+	exceeded bool
 }
 
+var errRoundToolOutputLimit = errors.New("media tool output limit")
+
 func (b *boundedRoundOutput) Write(p []byte) (int, error) {
-	if len(p) > b.limit-b.Len() {
-		return 0, errors.New("media tool output limit")
+	if len(p) > b.limit-b.buf.Len() {
+		b.exceeded = true
+		if b.onLimit != nil {
+			b.onLimit()
+		}
+		return 0, errRoundToolOutputLimit
 	}
-	return b.Buffer.Write(p)
+	return b.buf.Write(p)
 }
+
+func (b *boundedRoundOutput) Bytes() []byte { return b.buf.Bytes() }
 
 // runRoundTool neither logs untrusted media metadata nor includes ffmpeg's
 // stderr (which can contain filenames/metadata) in user-visible errors.
 func runRoundTool(ctx context.Context, binary string, args ...string) ([]byte, error) {
+	return runRoundToolLimited(ctx, 1024*1024, binary, args...)
+}
+
+func runRoundToolLimited(ctx context.Context, limit int, binary string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, binary, args...)
 	cmd.Stdin = nil
 	cmd.Stderr = io.Discard
 	cmd.WaitDelay = 2 * time.Second
-	output := &boundedRoundOutput{limit: 1024 * 1024}
+	output := &boundedRoundOutput{limit: limit, onLimit: cancel}
 	cmd.Stdout = output
 	if err := cmd.Run(); err != nil {
+		if output.exceeded {
+			return nil, errRoundToolOutputLimit
+		}
 		return nil, err
 	}
 	return output.Bytes(), nil
@@ -367,7 +392,7 @@ func prepareRoundMedia(ctx context.Context, path string, maxBytes int64) (_ *pre
 	if err != nil {
 		return nil, err
 	}
-	directory, err := os.MkdirTemp("", "telegram-round-*")
+	directory, err := os.MkdirTemp(roundTempDir(), "telegram-round-*")
 	if err != nil {
 		return nil, roundError("temporary_storage", err)
 	}
@@ -517,11 +542,11 @@ func prepareAndUploadRoundMediaTimed(ctx context.Context, path string, limit int
 	upload := uploader.NewUploader(api).WithThreads(telegramMediaUploadThreads).WithPartSize(uploader.MaximumPartSize)
 	file, err := upload.FromPath(ctx, prepared.Path, "round.mp4")
 	if err != nil {
-		return nil, roundMediaProfile{}, fmt.Errorf("round video upload failed: %w", err)
+		return nil, roundMediaProfile{}, roundUploadError(err)
 	}
 	thumbnail, err := upload.FromPath(ctx, prepared.ThumbnailPath, "thumbnail.jpg")
 	if err != nil {
-		return nil, roundMediaProfile{}, fmt.Errorf("round thumbnail upload failed: %w", err)
+		return nil, roundMediaProfile{}, roundUploadError(err)
 	}
 	return makeRoundUploadedDocument(file, thumbnail, prepared.Profile), prepared.Profile, nil
 }
@@ -550,7 +575,7 @@ func (tc *TelegramClient) downloadRoundMediaToFile(ctx context.Context, content 
 	start := time.Now()
 	response, err := bot.Matrix.Download(ctx, parsed)
 	if err != nil {
-		return fmt.Errorf("round media download failed: %w", err)
+		return roundError("media_download_failed", err)
 	}
 	defer response.Body.Close()
 	if response.ContentLength > limit {
@@ -575,7 +600,7 @@ func copyRoundDownloadToFileTimed(reader io.ReadCloser, limit int64, start time.
 	if limit <= 0 {
 		return roundError("upload_limit_unknown", nil)
 	}
-	f, err := os.CreateTemp("", "telegram-round-download-*")
+	f, err := os.CreateTemp(roundTempDir(), "telegram-round-download-*")
 	if err != nil {
 		return roundError("temporary_storage", err)
 	}
@@ -601,4 +626,64 @@ func copyRoundDownloadToFileTimed(reader io.ReadCloser, limit int64, start time.
 		return roundError("media_download_failed", err)
 	}
 	return callback(f)
+}
+
+// roundUploadError keeps a Telegram RPC error (FLOOD_WAIT, FILE_PARTS_INVALID)
+// as such, so it is classified and humanised as a Telegram answer; any other
+// upload failure is a retriable "upload_failed" (wave 5 F4).
+func roundUploadError(err error) error {
+	if _, ok := tgerr.As(err); ok {
+		return fmt.Errorf("round upload: %w", err)
+	}
+	return roundError("upload_failed", err)
+}
+
+// roundTempDirEnv points round preparation at a directory on the bridge's data
+// volume instead of the system temporary directory (wave 5 F10).
+const roundTempDirEnv = "TELEGRAM_ROUND_TMPDIR"
+
+// roundTempDirectory is set once at connector Init; "" means os.TempDir().
+var roundTempDirectory string
+
+func roundTempDirFromEnv() string {
+	dir := strings.TrimSpace(os.Getenv(roundTempDirEnv))
+	if dir == "" {
+		return ""
+	}
+	if info, err := os.Stat(dir); err != nil || !info.IsDir() {
+		return ""
+	}
+	roundTempDirectory = dir
+	return dir
+}
+
+func roundTempDir() string {
+	return roundTempDirectory
+}
+
+// sweepRoundTempFiles removes telegram-round-* leftovers older than maxAge, as
+// left by a crash or kill during preparation. Live sends finish within the
+// 5 minute transfer bound, so an hour is safely past any of them. Only our own
+// prefix is touched; symlinks are removed, never followed.
+func sweepRoundTempFiles(dir string, maxAge time.Duration, now time.Time) (removed int) {
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "telegram-round-") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < maxAge {
+			continue
+		}
+		if os.RemoveAll(filepath.Join(dir, entry.Name())) == nil {
+			removed++
+		}
+	}
+	return removed
 }

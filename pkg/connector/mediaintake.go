@@ -4,6 +4,7 @@
 package connector
 
 import (
+	"context"
 	"errors"
 
 	"go.mau.fi/util/ptr"
@@ -63,11 +64,14 @@ func roundMediaUnread(msg *tg.Message) *bool {
 	return ptr.Ptr(msg.MediaUnread)
 }
 
-func mediaPolicyForMessage(portal *bridgev2.Portal, msg *tg.Message) *TelegramMediaPolicy {
-	var protection *bool
+// mediaPolicyForMessage uses the protection decision of the current
+// conversion when there is one (see withProtectionDecision), otherwise the
+// portal's last known value.
+func mediaPolicyForMessage(ctx context.Context, portal *bridgev2.Portal, msg *tg.Message) *TelegramMediaPolicy {
+	protection, decided := protectionDecisionFrom(ctx)
 	if portal != nil {
-		if meta, ok := portal.Metadata.(*PortalMetadata); ok {
-			protection = meta.ProtectedContent
+		if !decided {
+			protection = getPortalProtection(portal)
 		}
 		// Telegram's chat/channel noforwards flag is not inherited by the
 		// message. A private chat has no chat-level noforwards flag.
@@ -120,6 +124,17 @@ func messageNeedsMediaTransfer(msg *tg.Message) bool {
 		}
 	}
 	return false
+}
+
+// keptTextPolicy is the wire policy of a text part bridged while chat
+// protection is unknown or on: displayable, with protected_content null or
+// true, so clients keep forward, copy and transcription off.
+func keptTextPolicy(policy *TelegramMediaPolicy) *TelegramMediaPolicy {
+	kept := &TelegramMediaPolicy{Version: policy.Version, TransferAllowed: true, LazySupported: policy.LazySupported}
+	if policy.ProtectedContent != nil {
+		kept.ProtectedContent = ptr.Ptr(*policy.ProtectedContent)
+	}
+	return kept
 }
 
 func blockedMediaPart(policy *TelegramMediaPolicy) *bridgev2.ConvertedMessagePart {

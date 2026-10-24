@@ -57,7 +57,6 @@ import (
 	"maunium.net/go/mautrix/id"
 
 	"go.mau.fi/mautrix-telegram/pkg/connector/emojis"
-	"go.mau.fi/mautrix-telegram/pkg/connector/humanise"
 	"go.mau.fi/mautrix-telegram/pkg/connector/ids"
 	"go.mau.fi/mautrix-telegram/pkg/connector/matrixfmt"
 	"go.mau.fi/mautrix-telegram/pkg/connector/media"
@@ -91,12 +90,6 @@ const telegramMediaUploadThreads = 4
 func (tc *TelegramClient) HandleMatrixViewingChat(ctx context.Context, msg *bridgev2.MatrixViewingChat) error {
 	if msg.Portal == nil {
 		return nil
-	}
-	if tc.IsLoggedIn() {
-		_, _ = tc.roundUploadLimit(ctx)
-		_, _ = tc.checkRoundPermission(ctx, msg.Portal)
-		msg.Portal.UpdateCapabilities(ctx, tc.userLogin, false)
-		tc.publishMediaCapabilities(ctx, msg.Portal)
 	}
 	_, _, topicID, _ := ids.ParsePortalID(msg.Portal.PortalKey.ID)
 	// TODO sync topic parent space
@@ -397,22 +390,47 @@ func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *
 	}, nil
 }
 
+// roundTransferError converts a pre-claim round preparation failure into a
+// message status: typed media errors keep their permanence, Telegram RPC
+// errors (FLOOD_WAIT on upload) stay RPC errors, anything else is transport.
+func (tc *TelegramClient) roundTransferError(err error) error {
+	return tc.humaniseSendError(classifyRoundOperationError(err, false))
+}
+
+// freshAllowedRoundPermission returns a cached allowed permission confirmed
+// within the last minute, or nil. A cached denial is always re-checked.
+func freshAllowedRoundPermission(portal *bridgev2.Portal, login string, now time.Time) *RoundPermission {
+	cached := getRoundPermission(portal, login)
+	if cached == nil || cached.Allowed == nil || !*cached.Allowed || cached.CheckedAtMS <= 0 {
+		return nil
+	}
+	age := now.Sub(time.UnixMilli(cached.CheckedAtMS))
+	if age < 0 || age > time.Minute {
+		return nil
+	}
+	return cached
+}
+
 func (tc *TelegramClient) humaniseSendError(err error) error {
 	if err == nil {
 		return nil
 	}
-	status := bridgev2.WrapErrorInStatus(err).
-		WithErrorReason(event.MessageStatusNetworkError).
-		WithMessage(humanise.Error(err))
 	var operation *RoundOperationError
 	if errors.As(err, &operation) {
-		status = status.WithMessage("Telegram media operation: " + operation.Code).
+		// The user sees a sentence; internal_error carries only the code.
+		message := roundUserMessage(operation.Code, telegramWaitSeconds(err))
+		if operation.Certainty != "certain" && operation.Code != "dispatch_in_progress" {
+			message = roundMessageUnconfirmed
+		}
+		status := bridgev2.WrapErrorInStatus(&roundStatusCause{code: operation.Code, cause: err}).
+			WithErrorReason(event.MessageStatusNetworkError).
+			WithMessage(message).
 			WithIsCertain(operation.Certainty == "certain")
 		if operation.Retriable || operation.Certainty != "certain" {
 			return status.WithStatus(event.MessageStatusRetriable)
 		}
 		switch operation.Code {
-		case "round_permission_denied", "round_forbidden", "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN", "VOICE_MESSAGES_FORBIDDEN", "CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED", "CHAT_RESTRICTED":
+		case "round_permission_denied", "round_forbidden", "CHAT_SEND_ROUNDVIDEOS_FORBIDDEN", "VOICE_MESSAGES_FORBIDDEN", "CHAT_WRITE_FORBIDDEN", "CHAT_ADMIN_REQUIRED", "CHAT_RESTRICTED", "USER_BANNED_IN_CHANNEL", "YOU_BLOCKED_USER", "USER_IS_BLOCKED":
 			status = status.WithErrorReason(event.MessageStatusNoPermission)
 		default:
 			status = status.WithErrorReason(event.MessageStatusUnsupported)
@@ -421,15 +439,19 @@ func (tc *TelegramClient) humaniseSendError(err error) error {
 	}
 	var roundErr *RoundMediaError
 	if errors.As(err, &roundErr) {
-		status = status.WithMessage("Round video rejected: " + roundErr.Code).
+		status := bridgev2.WrapErrorInStatus(&roundStatusCause{code: roundErr.Code, cause: err}).
+			WithMessage(roundUserMessage(roundErr.Code, 0)).
 			WithErrorReason(event.MessageStatusUnsupported).
 			WithIsCertain(true).WithStatus(event.MessageStatusFail)
-		if roundErr.Code == "upload_limit_unknown" || roundErr.Code == "encode_timeout" || roundErr.Code == "transfer_timeout" || roundErr.Code == "temporary_storage" || roundErr.Code == "media_download_failed" {
-			return status.WithIsCertain(true).WithStatus(event.MessageStatusRetriable)
+		if roundErr.Retriable() {
+			return status.WithStatus(event.MessageStatusRetriable)
 		}
 		return status
 	}
 
+	status := bridgev2.WrapErrorInStatus(err).
+		WithErrorReason(event.MessageStatusNetworkError).
+		WithMessage(humaniseTelegramMessage(err))
 	switch {
 	case tg.IsYouBlockedUser(err),
 		tg.IsUserIsBlocked(err),
@@ -581,7 +603,13 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 		// logs the final outcome.
 		defer func() { logRoundSendOutcome(&log, roundTimings, time.Since(roundStart), err) }()
 		phase := time.Now()
-		permission, permissionErr := tc.checkRoundPermission(ctx, msg.Portal)
+		// A permission confirmed in the last minute skips the first RPC
+		// (wave 5 F7). The check after the upload stays authoritative.
+		permission := freshAllowedRoundPermission(msg.Portal, string(tc.userLogin.ID), time.Now())
+		var permissionErr error
+		if permission == nil {
+			permission, permissionErr = tc.checkRoundPermission(ctx, msg.Portal)
+		}
 		roundTimings.Permission += time.Since(phase)
 		if permissionErr != nil {
 			return nil, tc.humaniseSendError(classifyRoundOperationError(permissionErr, false))
@@ -593,6 +621,7 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 			return nil, tc.humaniseSendError(mediaControlRejected("round_permission_denied"))
 		}
 		msg.Portal.UpdateCapabilities(ctx, tc.userLogin, false)
+		tc.publishMediaCapabilitiesIfChanged(ctx, msg.Portal)
 		defer func() {
 			if roundClaimed {
 				finishErr := tc.FinishRoundSend(ctx, roundOperation, resp, err, roundDispatched)
@@ -621,7 +650,7 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 				}
 				roundClaimed, roundDispatched = true, true
 				log.Info().Str("reconcile_result", "found").Msg("Telegram round send reconciled with an earlier accepted message")
-				return tc.roundMatrixResponse(ctx, msg, found.ID, found.Date, found.Media), nil
+				return tc.roundMatrixResponse(ctx, msg, found.ID, found.Date, found.Message, found.Media), nil
 			}
 			log.Info().Str("reconcile_result", reason).Msg("No earlier accepted Telegram round found, dispatching again with the same random ID")
 		}
@@ -705,6 +734,12 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 				media, err = tc.transferMediaToTelegram(ctx, msg.Content, false, false, forceDocument)
 			}
 			if err != nil {
+				if round {
+					// Not claimed yet: humanise here, or bridgev2 shows a
+					// generic retriable failure even for permanent profile
+					// errors (wave 5 F4).
+					return nil, tc.roundTransferError(err)
+				}
 				return nil, err
 			}
 			sendCtx := ctx
@@ -713,7 +748,7 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 				permission, permissionErr := tc.checkRoundPermission(ctx, msg.Portal)
 				roundTimings.Permission += time.Since(phase)
 				if permissionErr != nil {
-					return nil, classifyRoundOperationError(permissionErr, false)
+					return nil, tc.humaniseSendError(classifyRoundOperationError(permissionErr, false))
 				}
 				if permission.Allowed == nil {
 					return nil, tc.humaniseSendError(&RoundOperationError{Code: "round_permission_unknown", Certainty: "certain", Retriable: true})
@@ -805,12 +840,12 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 		if reason != "" {
 			log.Warn().Str("reason_code", reason).Str("echo_reason", ack.EchoReason).Strs("update_types", ack.UpdateTypes).Msg("Telegram accepted the round send but its echo is not a verified video note")
 		}
-		media := ack.Media
+		media, text := ack.Media, ""
 		if ack.Message != nil {
-			media = ack.Message.Media
+			media, text = ack.Message.Media, ack.Message.Message
 		}
 		log.Info().Bool("echo_verified", reason == "").Msg("Telegram round send accepted")
-		return tc.roundMatrixResponse(ctx, msg, ack.MessageID, ack.Date, media), nil
+		return tc.roundMatrixResponse(ctx, msg, ack.MessageID, ack.Date, text, media), nil
 	}
 
 	hasher := sha256.New()
@@ -882,6 +917,7 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 		Str("content_hash", base64.StdEncoding.EncodeToString(hash)).
 		Msg("sent message successfully")
 
+	sentProtection := getPortalProtection(msg.Portal)
 	resp = &bridgev2.MatrixMessageResponse{
 		DB: &database.Message{
 			ID:        messageID,
@@ -891,8 +927,8 @@ func (tc *TelegramClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2
 				ContentHash:     hash,
 				ContentURI:      contentURI,
 				IsRound:         round,
-				ProtectionKnown: round && msg.Portal.Metadata.(*PortalMetadata).ProtectedContent != nil,
-				NoForwards:      round && msg.Portal.Metadata.(*PortalMetadata).ProtectedContent != nil && *msg.Portal.Metadata.(*PortalMetadata).ProtectedContent,
+				ProtectionKnown: round && sentProtection != nil,
+				NoForwards:      round && sentProtection != nil && *sentProtection,
 			},
 		},
 		StreamOrder: int64(tgMessageID),

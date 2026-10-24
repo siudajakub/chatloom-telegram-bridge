@@ -60,6 +60,9 @@ type PortalMetadata struct {
 	roundPermissionLock sync.RWMutex
 	ProtectedContent    *bool                       `json:"protected_content,omitempty"`
 	RoundPermissions    map[string]*RoundPermission `json:"round_permissions,omitempty"`
+	// ProtectionCheckedAtMS is when ProtectedContent was last confirmed by
+	// Telegram (wave 5 F1); it bounds the stale-on-error fallback.
+	ProtectionCheckedAtMS int64 `json:"protection_checked_at_ms,omitempty"`
 
 	IsSuperGroup      bool          `json:"is_supergroup,omitempty"`
 	IsForumGeneral    bool          `json:"is_forum_general,omitempty"`

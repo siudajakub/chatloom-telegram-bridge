@@ -63,7 +63,8 @@ func (tc *TelegramConnector) GetCapabilities() *bridgev2.NetworkGeneralCapabilit
 }
 
 func (tc *TelegramConnector) GetBridgeInfoVersion() (info, capabilities int) {
-	return 1, 15
+	// 16: wave 5 sticker formats (image/gif, application/x-tgsticker).
+	return 1, 16
 }
 
 // TODO get these from getConfig instead of hardcoding?
@@ -147,6 +148,12 @@ var fileCaps = event.FileFeatureMap{
 			"image/webp":        event.CapLevelFullySupported,
 			"video/lottie+json": event.CapLevelFullySupported,
 			"video/webm":        event.CapLevelFullySupported,
+			// Telegram's own animated stickers as the bridge stores them
+			// (animated_sticker.target gif, or tgs without lottieconverter).
+			// The original document is re-sent when known, tgs is uploaded
+			// as is, anything else is converted to webp (wave 5 TF-02).
+			"application/x-tgsticker": event.CapLevelFullySupported,
+			"image/gif":               event.CapLevelPartialSupport,
 			// These are converted to webp
 			"image/jpeg": event.CapLevelPartialSupport,
 			"image/png":  event.CapLevelPartialSupport,
@@ -227,7 +234,9 @@ func viewLimitedFileCaps(base event.FileFeatureMap) event.FileFeatureMap {
 var telegramTimers = makeTimerList()
 
 func (tc *TelegramClient) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) *event.RoomFeatures {
-	baseID := "fi.mau.telegram.capabilities.2026_10_11.round.v1"
+	// The ID changes with the static caps so every portal receives them
+	// (bridgev2 compares only the ID).
+	baseID := "fi.mau.telegram.capabilities.2026_10_22.round.v2"
 	feat := &event.RoomFeatures{
 		Formatting:          formattingCaps,
 		File:                fileCaps,
@@ -339,7 +348,9 @@ func (tc *TelegramClient) GetCapabilities(ctx context.Context, portal *bridgev2.
 		// Hash the dynamic permission/limit instead of retaining a static ID
 		// that prevents the framework from publishing changed room features.
 		baseID += "+round_" + hex.EncodeToString(feat.File[event.CapabilityMsgType(roundCapabilityKey)].Hash())[:16]
-		tc.publishMediaCapabilities(ctx, portal)
+		// GetCapabilities runs for every Matrix message and reaction, often
+		// inside the portal loop: it stays free of side effects. The
+		// throttled refresh runs in its own goroutine (wave 5 F2/F3).
 		tc.queueRoundCapabilityRefresh(portal)
 	}
 	feat.ID = baseID

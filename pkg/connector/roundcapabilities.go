@@ -6,8 +6,10 @@ package connector
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"os/exec"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -68,11 +70,13 @@ func telegramMediaStateKey(portal *bridgev2.Portal) string {
 	return string(portal.BridgeID)
 }
 
-func roundToolsAvailable() bool {
+// roundToolsAvailable is checked once per process (wave 5 F12): it was two
+// PATH lookups on every capability computation.
+var roundToolsAvailable = sync.OnceValue(func() bool {
 	_, first := exec.LookPath("ffmpeg")
 	_, second := exec.LookPath("ffprobe")
 	return first == nil && second == nil
-}
+})
 
 func roundFileCapability(allowed *bool, limit *int64) *event.FileFeatures {
 	level := event.CapLevelRejected
@@ -101,11 +105,10 @@ func (tc *TelegramClient) roundAvailability(ctx context.Context, portal *bridgev
 	}
 	// Capability publication is allowed during room creation. It must never
 	// start an RPC while initial client setup is holding connection locks.
+	// The cached limit stays a valid hint when it is old (wave 5 TF-01): the
+	// send path re-reads it and Telegram enforces it.
 	tc.appConfigLock.Lock()
 	value, err := roundUploadLimitFromConfig(tc.appConfig, tc.isPremiumCache.Load())
-	if !tc.appConfigFetched.IsZero() && time.Since(tc.appConfigFetched) > 5*time.Minute {
-		err = roundError("upload_limit_unknown", nil)
-	}
 	tc.appConfigLock.Unlock()
 	if err == nil && tc.main.maxFileSize > 0 {
 		value = min(value, tc.main.maxFileSize)
@@ -132,15 +135,15 @@ func makeMediaCapabilities(accountID, roomID, stateKey string, allowed *bool, pe
 	return caps
 }
 
-func (tc *TelegramClient) publishMediaCapabilities(ctx context.Context, portal *bridgev2.Portal) {
+func (tc *TelegramClient) mediaCapabilitiesContent(ctx context.Context, portal *bridgev2.Portal) (map[string]any, string, bool) {
 	if portal == nil || portal.MXID == "" || tc.userLogin == nil || !tc.IsLoggedIn() {
-		return
+		return nil, "", false
 	}
 	if portal.Receiver != "" && portal.Receiver != tc.userLogin.ID {
-		return
+		return nil, "", false
 	}
 	if portal.CapState.Source != "" && portal.CapState.Source != tc.userLogin.ID {
-		return
+		return nil, "", false
 	}
 	allowed, permission, limit := tc.roundAvailability(ctx, portal)
 	stateKey := telegramMediaStateKey(portal)
@@ -157,14 +160,37 @@ func (tc *TelegramClient) publishMediaCapabilities(ctx context.Context, portal *
 	// Use JSON raw content so explicit false/null remain visible to clients.
 	data, err := json.Marshal(content)
 	if err != nil {
-		return
+		return nil, "", false
 	}
 	var raw map[string]any
 	if json.Unmarshal(data, &raw) != nil {
+		return nil, "", false
+	}
+	return raw, stateKey, true
+}
+
+// publishMediaCapabilitiesIfChanged sends the media capability state only
+// when its content differs from the last one this process sent to the room
+// (wave 5 F2). It is called from the capability refresh and after the
+// dispatch-time permission check of a round send, never from
+// GetCapabilities.
+func (tc *TelegramClient) publishMediaCapabilitiesIfChanged(ctx context.Context, portal *bridgev2.Portal) {
+	raw, stateKey, ok := tc.mediaCapabilitiesContent(ctx, portal)
+	if !ok {
+		return
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return
+	}
+	digest := sha256.Sum256(append([]byte(string(portal.MXID)+"\x00"+stateKey+"\x00"), data...))
+	if previous, loaded := tc.lastMediaCaps.Load(portal.PortalKey); loaded && previous.([32]byte) == digest {
 		return
 	}
 	_, err = tc.main.Bridge.Bot.SendState(ctx, portal.MXID, telegramMediaCapabilitiesEvent, stateKey, &event.Content{Raw: raw}, time.Time{})
 	if err != nil {
 		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to publish Telegram media capability state")
+		return
 	}
+	tc.lastMediaCaps.Store(portal.PortalKey, digest)
 }
