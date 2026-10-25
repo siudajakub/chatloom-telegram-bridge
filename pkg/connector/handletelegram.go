@@ -960,6 +960,9 @@ func (tc *TelegramClient) updateGhost(ctx context.Context, userID int64, user *t
 		return nil, err
 	}
 	ghost.UpdateInfo(ctx, userInfo)
+	if status, ok := user.GetStatus(); ok {
+		tc.onUserStatus(ctx, userID, status)
+	}
 
 	if !user.Min && ghost.ID == tc.userID && tc.updateRemoteProfile(ctx, user, ghost) {
 		tc.userLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
@@ -1106,7 +1109,8 @@ func (tc *TelegramClient) onUpdate(ctx context.Context, e tg.Entities, upd tg.Up
 	case *tg.UpdatePhoneCall:
 		return tc.onPhoneCall(ctx, e, update)
 	case *tg.UpdateUserStatus:
-		// ignored
+		// ChatLoom fork: forwarded as private room account data (presence.go).
+		tc.onUserStatus(ctx, update.UserID, update.Status)
 		return nil
 	default:
 		zerolog.Ctx(ctx).Debug().Type("update_type", update).Msg("Unhandled update type")

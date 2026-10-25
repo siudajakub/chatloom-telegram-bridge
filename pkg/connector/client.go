@@ -102,6 +102,8 @@ type TelegramClient struct {
 	lastMediaCaps         sync.Map // networkid.PortalKey -> [32]byte
 	capabilityRefreshFunc func(*bridgev2.Portal)
 	roundRefreshBlockedAt atomic.Int64
+	// ChatLoom fork: contact presence write throttle (presence.go).
+	presence presenceThrottle
 
 	availableReactionsLock    sync.Mutex
 	availableReactions        exmaps.Set[string]
@@ -590,6 +592,7 @@ func (tc *TelegramClient) Disconnect() {
 		tc.userLogin.Log.Debug().Msg("Waiting for client disconnection")
 		<-tc.clientDone.GetChan()
 	}
+	tc.presence.stop()
 
 	tc.userLogin.Log.Info().Msg("Disconnect complete")
 }

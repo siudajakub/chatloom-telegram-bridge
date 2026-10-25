@@ -101,7 +101,10 @@ type TelegramConfig struct {
 	VideoURLPreviewAsFile                bool                `yaml:"video_url_preview_as_file"`
 	BridgeCommunities                    bool                `yaml:"bridge_communities"`
 	DisplaynameTemplate                  string              `yaml:"displayname_template"`
-	displaynameTemplate                  *template.Template  `yaml:"-"`
+	// ChatLoom fork: write contacts' online/last seen to 1:1 portals as
+	// private room account data (com.chatloom.presence) via double puppet.
+	ChatloomPresence    bool               `yaml:"chatloom_presence"`
+	displaynameTemplate *template.Template `yaml:"-"`
 }
 
 func (c TelegramConfig) ShouldBridge(participantCount int) bool {
@@ -194,6 +197,7 @@ func upgradeConfig(helper up.Helper) {
 	helper.Copy(up.Bool, "video_url_preview_as_file")
 	helper.Copy(up.Bool, "bridge_communities")
 	helper.Copy(up.Str, "displayname_template")
+	helper.Copy(up.Bool, "chatloom_presence")
 }
 
 func (tc *TelegramConnector) GetConfig() (example string, data any, upgrader up.Upgrader) {

@@ -127,3 +127,9 @@ bridge_communities: true
 # {{ .UserID }} - the internal user ID of the Telegram user
 # {{ .Deleted }} - true if the user has been deleted, false otherwise
 displayname_template: "{{ if .Deleted }}Deleted account {{ .UserID }}{{ else }}{{ .FullName }}{{ end }}"
+
+# ChatLoom fork: write contacts' Telegram online/last seen status to 1:1
+# portals as private room account data (com.chatloom.presence) through your
+# double puppet. Needs double puppeting. Throttled to changes, at most one
+# write per contact per minute (plus an online refresh every 3 minutes).
+chatloom_presence: true
