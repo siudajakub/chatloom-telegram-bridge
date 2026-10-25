@@ -5,9 +5,9 @@
 package connector
 
 import (
+	"regexp"
 	"slices"
 	"strconv"
-	"strings"
 
 	"go.mau.fi/mautrix-telegram/pkg/connector/humanise"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/tgerr"
@@ -159,28 +159,24 @@ func telegramWaitSeconds(err error) int {
 	return 0
 }
 
-// humaniseTelegramMessage wraps upstream humanise.Error for message statuses:
-// waits get a sentence with the real seconds, upstream "{seconds}" templates
-// are filled in, and an unmapped Telegram RPC error gets a sentence instead
-// of "rpc error code …" (fork side of BR-15).
+// humaniseTelegramMessage wraps upstream humanise.Error for message statuses.
+// Upstream (since #1119) fills in its own placeholders and hides server
+// errors; the fork keeps a friendlier sentence for waits, a sentence instead
+// of "rpc error code …" for unmapped RPC errors, and a guard against any
+// template upstream still leaves unfilled (e.g. "{minutes}") (BR-15).
 func humaniseTelegramMessage(err error) string {
 	if tgerr.Is(err, "FLOOD_WAIT", "FLOOD_PREMIUM_WAIT", "SLOWMODE_WAIT") {
 		return telegramWaitMessage(telegramWaitSeconds(err))
 	}
 	text := humanise.Error(err)
-	if strings.Contains(text, "{seconds}") {
-		if seconds := telegramWaitSeconds(err); seconds > 0 {
-			text = strings.ReplaceAll(text, "{seconds}", strconv.Itoa(seconds))
-		} else {
-			text = strings.ReplaceAll(text, "{seconds} seconds", "a moment")
-			text = strings.ReplaceAll(text, "{seconds}", "a moment")
-		}
-	}
-	if _, isRPC := tgerr.As(err); isRPC && text == err.Error() {
+	_, isRPC := tgerr.As(err)
+	if (isRPC && text == err.Error()) || text == "" || unfilledPlaceholder.MatchString(text) {
 		return "Telegram didn't accept this message."
 	}
 	return text
 }
+
+var unfilledPlaceholder = regexp.MustCompile(`\{[a-z_]+\}`)
 
 // roundStatusCause is the message status internal error of a fork failure:
 // its text is the bare code (no Go error text in internal_error), and it

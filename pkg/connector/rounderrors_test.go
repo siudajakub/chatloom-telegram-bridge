@@ -120,6 +120,12 @@ func TestHumaniseTelegramMessageFillsSeconds(t *testing.T) {
 	text := humaniseTelegramMessage(tgerr.New(420, "SLOWMODE_WAIT_5"))
 	require.Equal(t, "Telegram asks you to wait 5 seconds before sending again.", text)
 	require.NotContains(t, humaniseTelegramMessage(tgerr.New(420, "FLOOD_PREMIUM_WAIT_0")), "{")
-	// Upstream returns a "{seconds}" template for this one.
 	require.NotContains(t, humaniseTelegramMessage(tgerr.New(420, "2FA_CONFIRM_WAIT_X")), "{")
+	// Upstream (#1119) fills its own templates now.
+	require.Equal(t, "Part 3 of the file is missing from storage", humaniseTelegramMessage(tgerr.New(400, "FILE_PART_3_MISSING")))
+	// ...but still leaves "{minutes}" and empty texts in a few entries.
+	require.Equal(t, "Telegram didn't accept this message.", humaniseTelegramMessage(tgerr.New(400, "PREVIOUS_CHAT_IMPORT_ACTIVE_WAIT_XMIN")))
+	require.Equal(t, "Telegram didn't accept this message.", humaniseTelegramMessage(tgerr.New(400, "PREMIUM_CURRENTLY_UNAVAILABLE")))
+	// Server errors are hidden upstream.
+	require.Equal(t, "Telegram is having internal issues, please try again later.", humaniseTelegramMessage(tgerr.New(500, "SYNTHETIC_INTERNAL")))
 }
