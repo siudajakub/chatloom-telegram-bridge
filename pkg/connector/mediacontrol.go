@@ -232,7 +232,10 @@ func (tc *TelegramConnector) authorizeMediaControl(ctx context.Context, evt *eve
 	// source until it is verified.
 	known := &authorizedMediaControl{Client: client, Source: source, Destination: source, Message: msg}
 	meta, ok := msg.Metadata.(*MessageMetadata)
-	if !ok || !meta.IsRound || meta.TTLSeconds != 0 || meta.MediaExpired || meta.NoForwards || !meta.ProtectionKnown || (meta.MediaPolicy != nil && !meta.MediaPolicy.TransferAllowed) {
+	// Marking a voice note listened transfers nothing, so it skips the
+	// forward-protection gates; the remote fetch checks it is a voice note.
+	voicePlay := ok && !meta.IsRound && evt.Type == MediaPlayedEventType
+	if !ok || meta.TTLSeconds != 0 || meta.MediaExpired || (!voicePlay && (!meta.IsRound || meta.NoForwards || !meta.ProtectionKnown || (meta.MediaPolicy != nil && !meta.MediaPolicy.TransferAllowed))) {
 		return known, mediaControlRejected("source_media_unavailable")
 	}
 	result := &authorizedMediaControl{Client: client, Source: source, Destination: source, Message: msg}

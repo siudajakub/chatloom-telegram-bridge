@@ -97,7 +97,7 @@ func (tc *TelegramClient) forwardMediaControl(ctx context.Context, req *MediaCon
 	if err := validateMediaControlAge(req, time.Now()); err != nil {
 		return err
 	}
-	source, msg, err := tc.controlSourceMessage(ctx, authorized)
+	source, msg, err := tc.controlSourceMessage(ctx, authorized, false)
 	if err != nil {
 		return classifyRoundOperationError(err, false)
 	}

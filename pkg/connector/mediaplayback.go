@@ -33,7 +33,8 @@ var _ mediaControlRPC = (*tg.Client)(nil)
 
 // fetchControlMedia checks current remote identity/media without downloading
 // bytes, thumbnails, file references, or falling back to a re-upload.
-func fetchControlMedia(ctx context.Context, rpc mediaControlRPC, peer tg.InputPeerClass, peerType ids.PeerType, messageID int) (*tg.Message, error) {
+// With allowVoice a voice note also qualifies (playback only, never forward).
+func fetchControlMedia(ctx context.Context, rpc mediaControlRPC, peer tg.InputPeerClass, peerType ids.PeerType, messageID int, allowVoice bool) (*tg.Message, error) {
 	var result tg.MessagesMessagesClass
 	var err error
 	input := []tg.InputMessageClass{&tg.InputMessageID{ID: messageID}}
@@ -79,6 +80,9 @@ func fetchControlMedia(ctx context.Context, rpc mediaControlRPC, peer tg.InputPe
 		}
 		for _, attr := range doc.Attributes {
 			if video, ok := attr.(*tg.DocumentAttributeVideo); ok && video.RoundMessage {
+				return msg, nil
+			}
+			if audio, ok := attr.(*tg.DocumentAttributeAudio); ok && audio.Voice && allowVoice {
 				return msg, nil
 			}
 		}
@@ -133,7 +137,7 @@ func readExactRoundContents(ctx context.Context, rpc mediaControlRPC, peer tg.In
 	return err
 }
 
-func (tc *TelegramClient) controlSourceMessage(ctx context.Context, authorized *authorizedMediaControl) (tg.InputPeerClass, *tg.Message, error) {
+func (tc *TelegramClient) controlSourceMessage(ctx context.Context, authorized *authorizedMediaControl, allowVoice bool) (tg.InputPeerClass, *tg.Message, error) {
 	peerType, _, _, err := ids.ParsePortalID(authorized.Source.ID)
 	if err != nil {
 		return nil, nil, err
@@ -146,7 +150,7 @@ func (tc *TelegramClient) controlSourceMessage(ctx context.Context, authorized *
 	if err != nil {
 		return nil, nil, err
 	}
-	msg, err := fetchControlMedia(ctx, tc.client.API(), peer, peerType, remoteID)
+	msg, err := fetchControlMedia(ctx, tc.client.API(), peer, peerType, remoteID, allowVoice)
 	return peer, msg, err
 }
 
@@ -154,15 +158,18 @@ func (tc *TelegramClient) controlSourceMessage(ctx context.Context, authorized *
 // state. It does not publish: the caller sends one media_state with the
 // result (wave 5 F13).
 func (tc *TelegramClient) playMediaControl(ctx context.Context, req *MediaControlRequest, authorized *authorizedMediaControl) (*store.RoundMediaState, error) {
-	peer, msg, err := tc.controlSourceMessage(ctx, authorized)
+	round := authorized.Message.Metadata.(*MessageMetadata).IsRound
+	peer, msg, err := tc.controlSourceMessage(ctx, authorized, !round)
 	if err != nil {
 		return nil, classifyRoundOperationError(err, false)
 	}
-	if msg.Noforwards {
+	if round && msg.Noforwards {
 		return nil, mediaControlRejected("protected_source")
 	}
-	if err = tc.checkCurrentForwardProtection(ctx, authorized); err != nil {
-		return nil, classifyRoundOperationError(err, false)
+	if round {
+		if err = tc.checkCurrentForwardProtection(ctx, authorized); err != nil {
+			return nil, classifyRoundOperationError(err, false)
+		}
 	}
 	if err = readExactRoundContents(ctx, tc.client.API(), peer, msg, req, time.Now()); err != nil {
 		return nil, err

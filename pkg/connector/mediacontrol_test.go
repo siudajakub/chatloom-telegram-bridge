@@ -167,7 +167,7 @@ func TestMediaControlSourceFetchRejectsForeignPeerTTLAndOrdinaryVideo(t *testing
 			m := syntheticRemoteRound(&tg.PeerUser{UserID: 777})
 			test.mutate(m)
 			rpc := &syntheticMediaRPC{messages: &tg.MessagesMessages{Messages: []tg.MessageClass{m}}}
-			_, err := fetchControlMedia(context.Background(), rpc, &tg.InputPeerUser{UserID: 777}, ids.PeerTypeUser, 42)
+			_, err := fetchControlMedia(context.Background(), rpc, &tg.InputPeerUser{UserID: 777}, ids.PeerTypeUser, 42, true)
 			require.Error(t, err)
 			require.Zero(t, rpc.contentsCalls+rpc.channelContentsCalls+rpc.forwardCalls)
 		})
@@ -295,4 +295,17 @@ func TestRoundOperationErrorCertainty(t *testing.T) {
 		require.Equal(t, test.certainty, typed.Certainty)
 		require.Equal(t, test.retry, typed.Retriable)
 	}
+}
+
+func TestMediaControlSourceFetchAcceptsVoiceOnlyForPlayback(t *testing.T) {
+	m := syntheticRemoteRound(&tg.PeerUser{UserID: 777})
+	m.Media.(*tg.MessageMediaDocument).Document.(*tg.Document).Attributes = []tg.DocumentAttributeClass{&tg.DocumentAttributeAudio{Voice: true, Duration: 3}}
+	rpc := &syntheticMediaRPC{messages: &tg.MessagesMessages{Messages: []tg.MessageClass{m}}}
+	_, err := fetchControlMedia(context.Background(), rpc, &tg.InputPeerUser{UserID: 777}, ids.PeerTypeUser, 42, true)
+	require.NoError(t, err)
+	_, err = fetchControlMedia(context.Background(), rpc, &tg.InputPeerUser{UserID: 777}, ids.PeerTypeUser, 42, false)
+	require.Error(t, err)
+	m.Media.(*tg.MessageMediaDocument).Document.(*tg.Document).Attributes = []tg.DocumentAttributeClass{&tg.DocumentAttributeAudio{Duration: 3}}
+	_, err = fetchControlMedia(context.Background(), rpc, &tg.InputPeerUser{UserID: 777}, ids.PeerTypeUser, 42, true)
+	require.Error(t, err)
 }
