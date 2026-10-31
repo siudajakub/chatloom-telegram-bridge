@@ -34,15 +34,20 @@ package waveform
 import "math"
 
 // NormalizeWaveform normalizes a waveform by bounding the values to the range
-// [0, 32] which is required for the encoding to work.
+// [0, 31] required by Telegram's 5-bit encoding. Values already in that range
+// retain their scale; larger envelopes are scaled proportionally to a peak of
+// 31. Negative samples are treated as silence.
 func NormalizeWaveform(waveform []int) (normalized []byte) {
 	normalized = make([]byte, len(waveform))
 	var waveformMax int
 	for _, v := range waveform {
 		waveformMax = max(waveformMax, v)
 	}
+	// Divide in floating point before scaling: multiplying a Matrix sample by
+	// 31 in an int could overflow on malformed or unusually large input.
+	scale := float64(max(waveformMax, 31))
 	for i, v := range waveform {
-		normalized[i] = byte(math.Round(float64(v) / float64(max(waveformMax/256, 1))))
+		normalized[i] = byte(min(31, int(math.Round(float64(max(v, 0))/scale*31))))
 	}
 	return
 }
@@ -55,6 +60,7 @@ func Encode(waveform []int) []byte {
 
 	var bitShift int
 	for i, v := range NormalizeWaveform(waveform) {
+		v &= 0b00011111
 		result[i*5/8] |= v << bitShift
 		result[i*5/8+1] |= v >> (8 - bitShift)
 		bitShift = (bitShift + 5) % 8

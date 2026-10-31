@@ -596,6 +596,8 @@ func (tc *TelegramConnector) registerGIFRoutes(ctx context.Context) {
 	}
 	tc.gifRoutesOnce.Do(func() {
 		addGIFRoutes(router, prov.GetLoginForRequest)
+		// Wave 11: the sticker catalogue routes (stickersearch.go).
+		addStickerSetRoutes(router, prov.GetLoginForRequest)
 	})
 }
 

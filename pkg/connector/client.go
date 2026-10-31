@@ -151,6 +151,10 @@ type TelegramClient struct {
 	// Wave 5b (ChatLoom fork): @gif search state (gifsearch.go).
 	gifs     *gifSearchState
 	gifsOnce sync.Once
+
+	// Wave 11 (ChatLoom fork): sticker catalogue state (stickersearch.go).
+	stickerSets     *stickerSetState
+	stickerSetsOnce sync.Once
 }
 
 var _ bridgev2.NetworkAPI = (*TelegramClient)(nil)

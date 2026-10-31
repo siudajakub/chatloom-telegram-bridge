@@ -18,7 +18,6 @@ package connector
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -61,7 +60,6 @@ import (
 	"go.mau.fi/mautrix-telegram/pkg/connector/matrixfmt"
 	"go.mau.fi/mautrix-telegram/pkg/connector/media"
 	"go.mau.fi/mautrix-telegram/pkg/connector/store"
-	"go.mau.fi/mautrix-telegram/pkg/connector/waveform"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/telegram/uploader"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/tg"
 	"go.mau.fi/mautrix-telegram/pkg/gotd/tgerr"
@@ -370,14 +368,7 @@ func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *
 			Stickerset: &tg.InputStickerSetEmpty{},
 		})
 	} else if content.MsgType == event.MsgAudio {
-		audioAttr := &tg.DocumentAttributeAudio{
-			Voice:    content.MSC3245Voice != nil,
-			Duration: info.Duration / 1000,
-		}
-		if content.MSC1767Audio != nil && len(content.MSC1767Audio.Waveform) > 0 {
-			audioAttr.Waveform = waveform.Encode(content.MSC1767Audio.Waveform)
-		}
-		attributes = append(attributes, audioAttr)
+		attributes = append(attributes, makeTelegramAudioAttribute(content))
 	} else if content.MsgType == event.MsgVideo {
 		attributes = append(attributes, &tg.DocumentAttributeVideo{
 			Duration: float64(info.Duration) / 1000,
@@ -386,11 +377,7 @@ func (tc *TelegramClient) transferMediaToTelegram(ctx context.Context, content *
 		})
 	}
 
-	return &tg.InputMediaUploadedDocument{
-		File:       upload,
-		MimeType:   cmp.Or(info.MimeType, "application/octet-stream"),
-		Attributes: attributes,
-	}, nil
+	return makeTelegramUploadedDocument(upload, content, info.MimeType, attributes), nil
 }
 
 // roundTransferError converts a pre-claim round preparation failure into a
