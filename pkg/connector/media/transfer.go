@@ -320,6 +320,13 @@ func (t *ReadyTransferer) Transfer(ctx context.Context, db *store.Container, int
 
 	if file, err := db.TelegramFile.GetByLocationID(ctx, locationID); err != nil {
 		return "", nil, nil, fmt.Errorf("failed to search for Telegram file by location ID: %w", err)
+	} else if want := t.expectedStickerConvertMime(); file != nil && want != "" && file.MIMEType != want {
+		// Cached before this sticker format was converted (or its conversion
+		// failed): convert it now instead of reusing the raw file.
+		log.Debug().
+			Str("cached_mime", file.MIMEType).
+			Str("expected_mime", want).
+			Msg("Ignoring cached sticker file that was not converted")
 	} else if file != nil {
 		t.inner.fileInfo.Size = file.Size
 		t.inner.fileInfo.Width = file.Width

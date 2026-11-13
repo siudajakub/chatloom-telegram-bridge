@@ -620,6 +620,9 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 
 	transferer := media.NewTransferer(tc.client.API()).WithRoomID(portal.MXID)
 	var mediaTransferer *media.ReadyTransferer
+	// A Telegram sticker document, kept for a still thumbnail if the sticker
+	// still reaches Matrix as WebM (see stickerStillThumbnail).
+	var stickerDocument *tg.Document
 
 	isWebPage := false
 	if unwrapped := unwrapWebPage(msgMedia); unwrapped != nil {
@@ -776,6 +779,7 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 				}
 			case *tg.DocumentAttributeSticker:
 				isSticker = true
+				stickerDocument = document
 				if content.Body == "" {
 					content.Body = a.Alt
 				} else {
@@ -893,6 +897,9 @@ func (tc *TelegramClient) convertMediaRequiringUpload(
 			}
 			return
 		}
+	}
+	if eventType == event.EventSticker {
+		tc.stickerStillThumbnail(ctx, portal, intent, stickerDocument, &content)
 	}
 	if eventType != event.EventSticker && content.MsgType.IsMedia() {
 		if (content.FileName == "" || content.FileName == content.Body) && !strings.ContainsRune(content.Body, '.') {
@@ -1263,4 +1270,39 @@ func (tc *TelegramClient) convertPhoto(ctx context.Context, peerType ids.PeerTyp
 	}
 
 	return avatar, nil
+}
+
+// stickerStillThumbnail gives an m.sticker that still carries WebM (its
+// WebP conversion failed, or the file came from a cache entry made before
+// conversion was turned on) Telegram's own still preview as a thumbnail.
+// Clients that cannot decode WebM (AVFoundation on macOS) draw that still
+// instead of an empty sticker frame. Converted stickers are left alone.
+func (tc *TelegramClient) stickerStillThumbnail(
+	ctx context.Context,
+	portal *bridgev2.Portal,
+	intent bridgev2.MatrixAPI,
+	document *tg.Document,
+	content *event.MessageEventContent,
+) {
+	info := content.Info
+	if document == nil || info == nil || info.MimeType != "video/webm" ||
+		info.ThumbnailURL != "" || info.ThumbnailFile != nil {
+		return
+	}
+	if thumbs, ok := document.GetThumbs(); !ok || len(thumbs) == 0 {
+		return
+	}
+	log := zerolog.Ctx(ctx).With().Int64("document_id", document.ID).Logger()
+	url, file, thumbInfo, err := media.NewTransferer(tc.client.API()).
+		WithRoomID(portal.MXID).
+		WithDocument(document, true).
+		Transfer(ctx, tc.main.Store, intent)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to transfer still thumbnail for WebM sticker")
+		return
+	}
+	info.ThumbnailURL = url
+	info.ThumbnailFile = file
+	info.ThumbnailInfo = thumbInfo
+	log.Debug().Msg("Sticker stayed WebM; added Telegram's still thumbnail")
 }

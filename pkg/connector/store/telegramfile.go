@@ -29,6 +29,9 @@ const (
 	insertTelegramFileQuery = `
 		INSERT INTO telegram_file (id, mxc, mime_type, size, width, height, timestamp)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (id) DO UPDATE SET
+			mxc=excluded.mxc, mime_type=excluded.mime_type, size=excluded.size,
+			width=excluded.width, height=excluded.height, timestamp=excluded.timestamp
 	`
 	getTelegramFileSelect            = "SELECT id, mxc, mime_type, size, width, height, timestamp FROM telegram_file"
 	getTelegramFileByLocationIDQuery = getTelegramFileSelect + " WHERE id=$1"
