@@ -280,6 +280,28 @@ func (tc *TelegramClient) FetchMessages(ctx context.Context, fetchParams bridgev
 			continue
 		}
 
+		if service, ok := msg.(*tg.MessageService); ok {
+			action, ok := service.Action.(*tg.MessageActionPhoneCall)
+			if !ok || portal.Disappear.Timer > 0 {
+				continue
+			}
+			converted := telegramPhoneCall(service, action)
+			if converted == nil {
+				continue
+			}
+			sender := tc.getEventSender(service, false)
+			if _, ok := portal.GetIntentFor(ctx, sender, tc.userLogin, bridgev2.RemoteEventBackfill); !ok {
+				continue
+			}
+			backfillMessages = append(backfillMessages, &bridgev2.BackfillMessage{
+				ConvertedMessage: converted,
+				Sender:           sender,
+				ID:               ids.GetMessageIDFromMessage(service),
+				Timestamp:        time.Unix(int64(service.Date), 0),
+				StreamOrder:      int64(service.GetID()),
+			})
+			continue
+		}
 		message, ok := msg.(*tg.Message)
 		if !ok {
 			log.Debug().Str("type", msg.TypeName()).Msg("skipping backfilling unsupported message type")

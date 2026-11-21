@@ -532,45 +532,14 @@ func (tc *TelegramClient) handleServiceMessage(ctx context.Context, msg *tg.Mess
 		})
 		return resultToError(res)
 	case *tg.MessageActionPhoneCall:
-		var body strings.Builder
-		if action.Video {
-			body.WriteString("Video call ")
-		} else {
-			body.WriteString("Call ")
-		}
-		switch action.Reason.TypeID() {
-		case tg.PhoneCallDiscardReasonMissedTypeID:
-			body.WriteString("missed")
-		case tg.PhoneCallDiscardReasonDisconnectTypeID:
-			body.WriteString("disconnected")
-		case tg.PhoneCallDiscardReasonHangupTypeID:
-			body.WriteString("ended")
-		case tg.PhoneCallDiscardReasonBusyTypeID:
-			body.WriteString("rejected")
-		default:
-			log.Warn().Stringer("end_reason", action.Reason).Msg("Unknown call end reason")
+		converted := telegramPhoneCall(msg, action)
+		if converted == nil {
 			return nil
 		}
-
-		if action.Duration > 0 {
-			body.WriteString(" (")
-			body.WriteString(exfmt.Duration(time.Duration(action.Duration) * time.Second))
-			body.WriteString(")")
-		}
-
-		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.Message[any]{
+		res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.PreConvertedMessage{
 			EventMeta: eventMeta.WithType(bridgev2.RemoteEventMessage),
 			ID:        ids.GetMessageIDFromMessage(msg),
-			ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data any) (*bridgev2.ConvertedMessage, error) {
-				return &bridgev2.ConvertedMessage{
-					Parts: []*bridgev2.ConvertedMessagePart{
-						{
-							Type:    event.EventMessage,
-							Content: &event.MessageEventContent{MsgType: event.MsgNotice, Body: body.String()},
-						},
-					},
-				}, nil
-			},
+			Data:      converted,
 		})
 		return resultToError(res)
 	case *tg.MessageActionGroupCall:
@@ -1773,17 +1742,11 @@ func (tc *TelegramClient) onPhoneCall(ctx context.Context, e tg.Entities, update
 		return nil
 	}
 
-	var callType event.BeeperActionMessageCallType
-	var body strings.Builder
-	body.WriteString("Started a ")
+	body := "Started a call"
 	if call.Video {
-		callType = event.BeeperActionMessageCallTypeVideo
-		body.WriteString("video call")
-	} else {
-		callType = event.BeeperActionMessageCallTypeVoice
-		body.WriteString("call")
+		body = "Started a video call"
 	}
-	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.Message[any]{
+	res := tc.main.Bridge.QueueRemoteEvent(tc.userLogin, &simplevent.PreConvertedMessage{
 		EventMeta: simplevent.EventMeta{
 			Type:         bridgev2.RemoteEventMessage,
 			PortalKey:    tc.makePortalKeyFromID(ids.PeerTypeUser, call.AdminID, 0),
@@ -1794,22 +1757,10 @@ func (tc *TelegramClient) onPhoneCall(ctx context.Context, e tg.Entities, update
 			},
 		},
 		ID: networkid.MessageID(fmt.Sprintf("call:requested-%d", call.ID)),
-		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data any) (*bridgev2.ConvertedMessage, error) {
-			return &bridgev2.ConvertedMessage{
-				Parts: []*bridgev2.ConvertedMessagePart{
-					{
-						Type: event.EventMessage,
-						Content: &event.MessageEventContent{
-							MsgType: event.MsgNotice,
-							Body:    body.String(),
-							BeeperActionMessage: &event.BeeperActionMessage{
-								Type:     event.BeeperActionMessageCall,
-								CallType: callType,
-							},
-						},
-					},
-				},
-			}, nil
+		Data: &bridgev2.ConvertedMessage{
+			Parts: []*bridgev2.ConvertedMessagePart{
+				callHistoryPart(body, call.Video, "incoming", "incoming", nil),
+			},
 		},
 	})
 	return resultToError(res)
